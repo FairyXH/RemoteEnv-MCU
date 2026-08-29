@@ -13,16 +13,19 @@ namespace {
 constexpr uint8_t kLedPin = 8;  // This board's onboard LED
 constexpr uint8_t kConfigButtonPin = 0;  // GPIO0, active low
 constexpr size_t kEepromSize = 640;
-constexpr uint32_t kConfigMagic = 0x52454332;
+constexpr uint32_t kConfigMagic = 0x52454333;
+constexpr uint32_t kPreviousConfigMagic = 0x52454332;
 constexpr size_t kPasswordHashLength = 64;
 constexpr size_t kSessionTokenLength = 32;
 constexpr uint32_t kSessionTimeoutMs = 1800000;
 constexpr uint32_t kUploadIntervalMs = 3000;
-constexpr uint32_t kSnapshotScanPauseMs = 30;
+constexpr uint32_t kDefaultUploadIntervalSeconds = 15;
+constexpr uint32_t kMinimumUploadIntervalSeconds = 5;
+constexpr uint32_t kMaximumUploadIntervalSeconds = 30;
 constexpr size_t kWifiSnapshotBufferSize = 8192;
 constexpr size_t kBluetoothSnapshotBufferSize = 12288;
 constexpr char kCombinedDataType[] = "bluetooth_wifi";
-constexpr uint8_t kMaxSnapshotRetries = 3;
+
 constexpr uint32_t kWifiConnectTimeoutMs = 15000;
 constexpr uint32_t kAuthTimeoutMs = 15000;
 constexpr uint32_t kApplicationPingIntervalMs = 10000;
@@ -41,6 +44,7 @@ struct DeviceConfig {
     char token[160];
     char deviceId[64];
     char passwordHash[65];
+    uint32_t uploadIntervalSeconds;
 };
 
 struct StoredConfig {
@@ -59,7 +63,7 @@ DeviceConfig config;
 WebSocketsClient websocket;
 WebServer webServer(80);
 uint32_t nextUploadAt = 0;
-uint64_t lastSequence = 0;
+uint32_t uploadIntervalSeconds = kDefaultUploadIntervalSeconds;
 bool authenticated = false;
 bool configMode = false;
 bool lastButtonState = HIGH;
@@ -77,8 +81,6 @@ bool webServerStarted = false;
 bool webRoutesRegistered = false;
 bool wifiConnecting = false;
 bool webSocketStarted = false;
-
-SemaphoreHandle_t snapshotMutex = nullptr;
 char wifiSnapshot[kWifiSnapshotBufferSize] = "{\"networks\":[]}";
 char bluetoothSnapshot[kBluetoothSnapshotBufferSize] = "{\"devices\":[]}";
 size_t wifiSnapshotLength = sizeof("{\"networks\":[]}") - 1;
@@ -87,8 +89,6 @@ uint64_t wifiSnapshotAt = 0;
 uint64_t bluetoothSnapshotAt = 0;
 bool wifiSnapshotReady = false;
 bool bluetoothSnapshotReady = false;
-TaskHandle_t scannerTaskHandle = nullptr;
-volatile bool scannerEnabled = false;
 
 void addLog(const String& message) {
     Serial.println(message);
@@ -209,8 +209,9 @@ void loadConfig() {
     StoredConfig stored{};
     EEPROM.get(0, stored);
     legacyConfig = stored.magic == 0x52454331;
-    if (legacyConfig || stored.magic == kConfigMagic) {
+    if (legacyConfig || stored.magic == kConfigMagic || stored.magic == kPreviousConfigMagic) {
         config = stored.config;
+        if (stored.magic == kPreviousConfigMagic) config.uploadIntervalSeconds = kDefaultUploadIntervalSeconds;
         if (legacyConfig) {
             memset(config.passwordHash, 0, sizeof(config.passwordHash));
         }
@@ -222,7 +223,12 @@ void loadConfig() {
         config.passwordHash[sizeof(config.passwordHash) - 1] = '\0';
     } else {
         memset(&config, 0, sizeof(config));
+        config.uploadIntervalSeconds = kDefaultUploadIntervalSeconds;
     }
+    if (config.uploadIntervalSeconds < kMinimumUploadIntervalSeconds || config.uploadIntervalSeconds > kMaximumUploadIntervalSeconds) {
+        config.uploadIntervalSeconds = kDefaultUploadIntervalSeconds;
+    }
+    uploadIntervalSeconds = config.uploadIntervalSeconds;
 }
 
 void saveConfig() {
@@ -320,7 +326,7 @@ uint64_t currentEpochMillis();
 void blinkConnected();
 String base64Encode(const uint8_t* data, size_t length);
 
-void updateBluetoothSnapshot() {
+void scanBluetoothSnapshot() {
     NimBLEScan* scanner = NimBLEDevice::getScan();
     scanner->setActiveScan(true);
     scanner->setInterval(45);
@@ -364,19 +370,16 @@ void updateBluetoothSnapshot() {
     }
     String encoded;
     serializeJson(document, encoded);
-    if (snapshotMutex && xSemaphoreTake(snapshotMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        if (encoded.length() < sizeof(bluetoothSnapshot)) {
-            encoded.toCharArray(bluetoothSnapshot, sizeof(bluetoothSnapshot));
-            bluetoothSnapshotLength = encoded.length();
-            bluetoothSnapshotAt = currentEpochMillis();
-            bluetoothSnapshotReady = true;
-        }
-        xSemaphoreGive(snapshotMutex);
+    if (encoded.length() < sizeof(bluetoothSnapshot)) {
+        encoded.toCharArray(bluetoothSnapshot, sizeof(bluetoothSnapshot));
+        bluetoothSnapshotLength = encoded.length();
+        bluetoothSnapshotAt = currentEpochMillis();
+        bluetoothSnapshotReady = true;
     }
     scanner->clearResults();
 }
 
-void updateWifiSnapshot() {
+void scanWifiSnapshot() {
     const int count = WiFi.scanNetworks(false, true);
     addLog(String("WiFi 流扫描帧：") + count + " 个");
     DynamicJsonDocument document(8192);
@@ -391,29 +394,13 @@ void updateWifiSnapshot() {
     }
     String encoded;
     serializeJson(document, encoded);
-    if (snapshotMutex && xSemaphoreTake(snapshotMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        if (encoded.length() < sizeof(wifiSnapshot)) {
-            encoded.toCharArray(wifiSnapshot, sizeof(wifiSnapshot));
-            wifiSnapshotLength = encoded.length();
-            wifiSnapshotAt = currentEpochMillis();
-            wifiSnapshotReady = true;
-        }
-        xSemaphoreGive(snapshotMutex);
+    if (encoded.length() < sizeof(wifiSnapshot)) {
+        encoded.toCharArray(wifiSnapshot, sizeof(wifiSnapshot));
+        wifiSnapshotLength = encoded.length();
+        wifiSnapshotAt = currentEpochMillis();
+        wifiSnapshotReady = true;
     }
     WiFi.scanDelete();
-}
-
-void scannerTask(void*) {
-    for (;;) {
-        if (!scannerEnabled || WiFi.status() != WL_CONNECTED) {
-            vTaskDelay(pdMS_TO_TICKS(500));
-            continue;
-        }
-        updateBluetoothSnapshot();
-        vTaskDelay(pdMS_TO_TICKS(kSnapshotScanPauseMs));
-        updateWifiSnapshot();
-        vTaskDelay(pdMS_TO_TICKS(kSnapshotScanPauseMs));
-    }
 }
 
 void sendCombinedSnapshot() {
@@ -421,6 +408,8 @@ void sendCombinedSnapshot() {
         addLog("组合快照跳过：WebSocket 未认证或已断开");
         return;
     }
+    scanBluetoothSnapshot();
+    scanWifiSnapshot();
     const uint64_t timestamp = currentEpochMillis();
     if (timestamp == 0) {
         addLog("组合快照跳过：NTP 尚未同步");
@@ -431,13 +420,10 @@ void sendCombinedSnapshot() {
     char bluetoothCopy[kBluetoothSnapshotBufferSize];
     bool wifiReady = false;
     bool bluetoothReady = false;
-    if (snapshotMutex && xSemaphoreTake(snapshotMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        memcpy(wifiCopy, wifiSnapshot, wifiSnapshotLength + 1);
-        memcpy(bluetoothCopy, bluetoothSnapshot, bluetoothSnapshotLength + 1);
-        wifiReady = wifiSnapshotReady;
-        bluetoothReady = bluetoothSnapshotReady;
-        xSemaphoreGive(snapshotMutex);
-    }
+    memcpy(wifiCopy, wifiSnapshot, wifiSnapshotLength + 1);
+    memcpy(bluetoothCopy, bluetoothSnapshot, bluetoothSnapshotLength + 1);
+    wifiReady = wifiSnapshotReady;
+    bluetoothReady = bluetoothSnapshotReady;
     if (!wifiReady) strcpy(wifiCopy, "{\"networks\":[]}");
     if (!bluetoothReady) strcpy(bluetoothCopy, "{\"devices\":[]}");
 
@@ -447,17 +433,14 @@ void sendCombinedSnapshot() {
     message["device_id"] = config.deviceId;
     message["data_type"] = kCombinedDataType;
     message["timestamp"] = timestamp;
-    lastSequence = timestamp > lastSequence ? timestamp : lastSequence + 1;
-    message["sequence"] = lastSequence;
+    message["sequence"] = timestamp;
     JsonObject data = message["data"].to<JsonObject>();
     DynamicJsonDocument wifiDocument(kWifiSnapshotBufferSize);
     DynamicJsonDocument bluetoothDocument(kBluetoothSnapshotBufferSize);
     deserializeJson(wifiDocument, wifiCopy);
     deserializeJson(bluetoothDocument, bluetoothCopy);
-    JsonObject wifiData = data["wifi"].to<JsonObject>();
-    JsonObject bluetoothData = data["bluetooth"].to<JsonObject>();
-    for (JsonPair pair : wifiDocument.as<JsonObject>()) wifiData[pair.key()] = pair.value();
-    for (JsonPair pair : bluetoothDocument.as<JsonObject>()) bluetoothData[pair.key()] = pair.value();
+    data["wifi"] = wifiDocument.as<JsonObject>();
+    data["bluetooth"] = bluetoothDocument.as<JsonObject>();
 
     String payload;
     serializeJson(message, payload);
@@ -615,7 +598,7 @@ void handleConfigPage() {
     page += F("<label>WiFi 密码<input name='password' type='password' maxlength='63' value='"); page += htmlEscape(config.wifiPassword); page += F("'></label>");
     page += F("<label>WS 地址<input name='ws' maxlength='159' required value='"); page += htmlEscape(config.wsUrl); page += F("'></label>");
     page += F("<label>Token<input name='token' maxlength='159' required value='"); page += htmlEscape(config.token); page += F("'></label>");
-    page += F("<label>设备 ID<input name='device' maxlength='63' required value='"); page += htmlEscape(config.deviceId); page += F("'></label><label>新管理密码<input name='newPassword' type='password' minlength='8' maxlength='96' placeholder='留空则保持不变'></label><label>确认新管理密码<input name='confirmPassword' type='password' minlength='8' maxlength='96' placeholder='留空则保持不变'></label><button type='submit'>保存配置</button></form><p><a href='/panel'>打开运行面板</a> · <form method='post' action='/logout' style='display:inline'><button type='submit' style='width:auto;margin:0;padding:4px 10px;background:#68737d'>退出登录</button></form></p></main></body></html>");
+    page += F("<label>设备 ID<input name='device' maxlength='63' required value='"); page += htmlEscape(config.deviceId); page += F("'></label><label>上传间隔（秒，5-30）<input name='interval' type='number' min='5' max='30' required value='"); page += uploadIntervalSeconds; page += F("'></label><label>新管理密码<input name='newPassword' type='password' minlength='8' maxlength='96' placeholder='留空则保持不变'></label><label>确认新管理密码<input name='confirmPassword' type='password' minlength='8' maxlength='96' placeholder='留空则保持不变'></label><button type='submit'>保存配置</button></form><p><a href='/panel'>打开运行面板</a> · <form method='post' action='/logout' style='display:inline'><button type='submit' style='width:auto;margin:0;padding:4px 10px;background:#68737d'>退出登录</button></form></p></main></body></html>");
     webServer.send(200, "text/html; charset=utf-8", page);
 }
 
@@ -649,7 +632,7 @@ void handleSaveConfig() {
     }
     if (!requireSession()) return;
     if (!webServer.hasArg("ssid") || !webServer.hasArg("password") ||
-        !webServer.hasArg("ws") || !webServer.hasArg("token") || !webServer.hasArg("device")) {
+        !webServer.hasArg("ws") || !webServer.hasArg("token") || !webServer.hasArg("device") || !webServer.hasArg("interval")) {
         webServer.send(400, "text/plain; charset=utf-8", "缺少配置字段");
         return;
     }
@@ -666,6 +649,14 @@ void handleSaveConfig() {
     copyField(config.wsUrl, sizeof(config.wsUrl), ws);
     copyField(config.token, sizeof(config.token), webServer.arg("token"));
     copyField(config.deviceId, sizeof(config.deviceId), webServer.arg("device"));
+    const long requestedInterval = webServer.arg("interval").toInt();
+    if (requestedInterval < static_cast<long>(kMinimumUploadIntervalSeconds) ||
+        requestedInterval > static_cast<long>(kMaximumUploadIntervalSeconds)) {
+        webServer.send(400, "text/plain; charset=utf-8", "上传间隔必须是 5 到 30 秒");
+        return;
+    }
+    uploadIntervalSeconds = static_cast<uint32_t>(requestedInterval);
+    config.uploadIntervalSeconds = uploadIntervalSeconds;
     const String newPassword = webServer.arg("newPassword");
     const String confirmPassword = webServer.arg("confirmPassword");
     if (newPassword.length() > 0) {
@@ -713,7 +704,6 @@ void startConfigMode() {
         return;
     }
     configMode = true;
-    scannerEnabled = false;
     configModeStartedAt = millis();
     lastConfigActivityAt = configModeStartedAt;
     authenticated = false;
@@ -752,10 +742,8 @@ void maintainWifi() {
             if (!webServerStarted) startLocalWebServer();
             nextWebSocketRetryAt = now;
         }
-        scannerEnabled = true;
         return;
     }
-    scannerEnabled = false;
     authenticated = false;
     if (webSocketStarted) {
         websocket.disconnect();
@@ -838,17 +826,12 @@ void setup() {
     pinMode(kConfigButtonPin, INPUT_PULLUP);
     Serial.printf("LED GPIO=%u, GPIO0=%s\n", kLedPin, digitalRead(kConfigButtonPin) == LOW ? "LOW" : "HIGH");
     NimBLEDevice::init("");
-    snapshotMutex = xSemaphoreCreateMutex();
-    if (snapshotMutex) {
-        xTaskCreatePinnedToCore(scannerTask, "environment-scan", 8192, nullptr, 1, &scannerTaskHandle, 0);
-    }
     loadConfig();
 
     if (!hasConfig() || digitalRead(kConfigButtonPin) == LOW) {
         startConfigMode();
         return;
     }
-    scannerEnabled = true;
     beginWifiAttempt();
     startLocalWebServer();
 }
@@ -872,7 +855,7 @@ void loop() {
         maintainWebSocket();
         const uint32_t now = millis();
         if (static_cast<int32_t>(now - nextUploadAt) >= 0) {
-            nextUploadAt = now + kUploadIntervalMs;
+            nextUploadAt = now + uploadIntervalSeconds * 1000UL;
             sendCombinedSnapshot();
         }
     }
