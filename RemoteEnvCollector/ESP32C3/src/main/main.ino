@@ -18,6 +18,7 @@ constexpr size_t kPasswordHashLength = 64;
 constexpr size_t kSessionTokenLength = 32;
 constexpr uint32_t kSessionTimeoutMs = 1800000;
 constexpr uint32_t kUploadIntervalMs = 3000;
+constexpr uint32_t kBluetoothScanIntervalMs = 15000;
 constexpr uint32_t kWifiConnectTimeoutMs = 15000;
 constexpr uint32_t kAuthTimeoutMs = 15000;
 constexpr uint32_t kApplicationPingIntervalMs = 10000;
@@ -54,6 +55,7 @@ DeviceConfig config;
 WebSocketsClient websocket;
 WebServer webServer(80);
 uint32_t nextUploadAt = 0;
+uint32_t nextBluetoothScanAt = 0;
 bool authenticated = false;
 bool configMode = false;
 bool lastButtonState = HIGH;
@@ -303,7 +305,10 @@ void blinkConnected();
 String base64Encode(const uint8_t* data, size_t length);
 
 void sendBluetoothData() {
-    if (!authenticated || WiFi.status() != WL_CONNECTED || !websocket.isConnected()) return;
+    if (!authenticated || WiFi.status() != WL_CONNECTED || !websocket.isConnected()) {
+        addLog("Bluetooth 跳过：WebSocket 未认证或 WiFi 未连接");
+        return;
+    }
     const uint64_t epochMillis = currentEpochMillis();
     if (epochMillis == 0) return;
 
@@ -312,6 +317,7 @@ void sendBluetoothData() {
     scanner->setInterval(45);
     scanner->setWindow(15);
     NimBLEScanResults results = scanner->getResults(4, false);
+    addLog(String("Bluetooth 扫描完成：") + results.getCount() + " 个");
 
     DynamicJsonDocument message(12288);
     message["type"] = "environment_data";
@@ -353,10 +359,11 @@ void sendBluetoothData() {
     String payload;
     serializeJson(message, payload);
     const bool sent = websocket.sendTXT(payload);
+    const int resultCount = results.getCount();
     scanner->clearResults();
     if (sent && authenticated && websocket.isConnected()) {
         blinkConnected();
-        addLog(String("上传 Bluetooth: ") + results.getCount() + " 个");
+        addLog(String("上传 Bluetooth: ") + resultCount + " 个");
     } else {
         addLog("上传 Bluetooth 失败");
     }
@@ -792,9 +799,12 @@ void loop() {
         websocket.loop();
         maintainWebSocket();
         const uint32_t now = millis();
+        if (static_cast<int32_t>(now - nextBluetoothScanAt) >= 0) {
+            nextBluetoothScanAt = now + kBluetoothScanIntervalMs;
+            sendBluetoothData();
+        }
         if (static_cast<int32_t>(now - nextUploadAt) >= 0) {
             nextUploadAt = now + kUploadIntervalMs;
-            sendBluetoothData();
             sendWifiData();
         }
     }
