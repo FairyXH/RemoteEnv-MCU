@@ -18,7 +18,11 @@ constexpr size_t kPasswordHashLength = 64;
 constexpr size_t kSessionTokenLength = 32;
 constexpr uint32_t kSessionTimeoutMs = 1800000;
 constexpr uint32_t kUploadIntervalMs = 3000;
-constexpr uint32_t kBluetoothScanIntervalMs = 15000;
+constexpr uint32_t kSnapshotScanPauseMs = 30;
+constexpr size_t kWifiSnapshotBufferSize = 8192;
+constexpr size_t kBluetoothSnapshotBufferSize = 12288;
+constexpr char kCombinedDataType[] = "bluetooth_wifi";
+constexpr uint8_t kMaxSnapshotRetries = 3;
 constexpr uint32_t kWifiConnectTimeoutMs = 15000;
 constexpr uint32_t kAuthTimeoutMs = 15000;
 constexpr uint32_t kApplicationPingIntervalMs = 10000;
@@ -55,7 +59,7 @@ DeviceConfig config;
 WebSocketsClient websocket;
 WebServer webServer(80);
 uint32_t nextUploadAt = 0;
-uint32_t nextBluetoothScanAt = 0;
+uint64_t lastSequence = 0;
 bool authenticated = false;
 bool configMode = false;
 bool lastButtonState = HIGH;
@@ -73,6 +77,17 @@ bool webServerStarted = false;
 bool webRoutesRegistered = false;
 bool wifiConnecting = false;
 bool webSocketStarted = false;
+
+SemaphoreHandle_t snapshotMutex = nullptr;
+char wifiSnapshot[kWifiSnapshotBufferSize] = "{\"networks\":[]}";
+char bluetoothSnapshot[kBluetoothSnapshotBufferSize] = "{\"devices\":[]}";
+size_t wifiSnapshotLength = sizeof("{\"networks\":[]}") - 1;
+size_t bluetoothSnapshotLength = sizeof("{\"devices\":[]}") - 1;
+uint64_t wifiSnapshotAt = 0;
+uint64_t bluetoothSnapshotAt = 0;
+bool wifiSnapshotReady = false;
+bool bluetoothSnapshotReady = false;
+TaskHandle_t scannerTaskHandle = nullptr;
 
 void addLog(const String& message) {
     Serial.println(message);
@@ -304,30 +319,18 @@ uint64_t currentEpochMillis();
 void blinkConnected();
 String base64Encode(const uint8_t* data, size_t length);
 
-void sendBluetoothData() {
-    if (!authenticated || WiFi.status() != WL_CONNECTED || !websocket.isConnected()) {
-        addLog("Bluetooth 跳过：WebSocket 未认证或 WiFi 未连接");
-        return;
-    }
-    const uint64_t epochMillis = currentEpochMillis();
-    if (epochMillis == 0) return;
-
+void updateBluetoothSnapshot() {
     NimBLEScan* scanner = NimBLEDevice::getScan();
     scanner->setActiveScan(true);
     scanner->setInterval(45);
     scanner->setWindow(15);
-    NimBLEScanResults results = scanner->getResults(4, false);
-    addLog(String("Bluetooth 扫描完成：") + results.getCount() + " 个");
+    NimBLEScanResults results = scanner->getResults(1, false);
+    addLog(String("Bluetooth 流扫描帧：") + results.getCount() + " 个");
 
-    DynamicJsonDocument message(12288);
-    message["type"] = "environment_data";
-    message["version"] = 1;
-    message["device_id"] = config.deviceId;
-    message["data_type"] = "bluetooth";
-    message["timestamp"] = epochMillis;
-    message["sequence"] = epochMillis;
-    JsonArray devices = message["data"]["devices"].to<JsonArray>();
-    for (int i = 0; i < results.getCount(); ++i) {
+    DynamicJsonDocument document(12288);
+    JsonArray devices = document["devices"].to<JsonArray>();
+    const int count = results.getCount();
+    for (int i = 0; i < count; ++i) {
         const NimBLEAdvertisedDevice* device = results.getDevice(i);
         JsonObject item = devices.add<JsonObject>();
         item["name"] = device->haveName() ? device->getName().c_str() : "";
@@ -340,7 +343,9 @@ void sendBluetoothData() {
             for (int j = 0; j < device->getServiceUUIDCount(); ++j) {
                 uuids.add(device->getServiceUUID(j).toString().c_str());
             }
-            if (device->getServiceUUIDCount() > 0) item["uuid"] = device->getServiceUUID(0).toString().c_str();
+            if (device->getServiceUUIDCount() > 0) {
+                item["uuid"] = device->getServiceUUID(0).toString().c_str();
+            }
         }
         if (device->haveManufacturerData()) {
             JsonObject manufacturers = item["manufacturerData"].to<JsonObject>();
@@ -356,38 +361,25 @@ void sendBluetoothData() {
             item["raw"] = base64Encode(reinterpret_cast<const uint8_t*>(raw.data()), raw.length());
         }
     }
-    String payload;
-    serializeJson(message, payload);
-    const bool sent = websocket.sendTXT(payload);
-    const int resultCount = results.getCount();
+    String encoded;
+    serializeJson(document, encoded);
+    if (snapshotMutex && xSemaphoreTake(snapshotMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (encoded.length() < sizeof(bluetoothSnapshot)) {
+            encoded.toCharArray(bluetoothSnapshot, sizeof(bluetoothSnapshot));
+            bluetoothSnapshotLength = encoded.length();
+            bluetoothSnapshotAt = currentEpochMillis();
+            bluetoothSnapshotReady = true;
+        }
+        xSemaphoreGive(snapshotMutex);
+    }
     scanner->clearResults();
-    if (sent && authenticated && websocket.isConnected()) {
-        blinkConnected();
-        addLog(String("上传 Bluetooth: ") + resultCount + " 个");
-    } else {
-        addLog("上传 Bluetooth 失败");
-    }
 }
-void sendWifiData() {
-    if (!authenticated || WiFi.status() != WL_CONNECTED) {
-        return;
-    }
-    const uint64_t epochMillis = currentEpochMillis();
-    if (epochMillis == 0) {
-        addLog("等待北京时间 NTP 同步");
-        return;
-    }
 
+void updateWifiSnapshot() {
     const int count = WiFi.scanNetworks(false, true);
-    StaticJsonDocument<4096> message;
-    message["type"] = "environment_data";
-    message["version"] = 1;
-    message["device_id"] = config.deviceId;
-    message["data_type"] = "wifi";
-    message["timestamp"] = epochMillis;
-    message["sequence"] = epochMillis;
-    JsonObject data = message["data"].to<JsonObject>();
-    JsonArray networks = data["networks"].to<JsonArray>();
+    addLog(String("WiFi 流扫描帧：") + count + " 个");
+    DynamicJsonDocument document(8192);
+    JsonArray networks = document["networks"].to<JsonArray>();
     for (int i = 0; i < count; ++i) {
         JsonObject network = networks.add<JsonObject>();
         network["ssid"] = WiFi.SSID(i);
@@ -396,15 +388,80 @@ void sendWifiData() {
         network["channel"] = WiFi.channel(i);
         network["encryption"] = static_cast<int>(WiFi.encryptionType(i));
     }
+    String encoded;
+    serializeJson(document, encoded);
+    if (snapshotMutex && xSemaphoreTake(snapshotMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (encoded.length() < sizeof(wifiSnapshot)) {
+            encoded.toCharArray(wifiSnapshot, sizeof(wifiSnapshot));
+            wifiSnapshotLength = encoded.length();
+            wifiSnapshotAt = currentEpochMillis();
+            wifiSnapshotReady = true;
+        }
+        xSemaphoreGive(snapshotMutex);
+    }
+    WiFi.scanDelete();
+}
+
+void scannerTask(void*) {
+    for (;;) {
+        updateBluetoothSnapshot();
+        vTaskDelay(pdMS_TO_TICKS(kSnapshotScanPauseMs));
+        updateWifiSnapshot();
+        vTaskDelay(pdMS_TO_TICKS(kSnapshotScanPauseMs));
+    }
+}
+
+void sendCombinedSnapshot() {
+    if (!authenticated || !websocket.isConnected()) {
+        addLog("组合快照跳过：WebSocket 未认证或已断开");
+        return;
+    }
+    const uint64_t timestamp = currentEpochMillis();
+    if (timestamp == 0) {
+        addLog("组合快照跳过：NTP 尚未同步");
+        return;
+    }
+
+    char wifiCopy[kWifiSnapshotBufferSize];
+    char bluetoothCopy[kBluetoothSnapshotBufferSize];
+    bool wifiReady = false;
+    bool bluetoothReady = false;
+    if (snapshotMutex && xSemaphoreTake(snapshotMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        memcpy(wifiCopy, wifiSnapshot, wifiSnapshotLength + 1);
+        memcpy(bluetoothCopy, bluetoothSnapshot, bluetoothSnapshotLength + 1);
+        wifiReady = wifiSnapshotReady;
+        bluetoothReady = bluetoothSnapshotReady;
+        xSemaphoreGive(snapshotMutex);
+    }
+    if (!wifiReady) strcpy(wifiCopy, "{\"networks\":[]}");
+    if (!bluetoothReady) strcpy(bluetoothCopy, "{\"devices\":[]}");
+
+    DynamicJsonDocument message(24576);
+    message["type"] = "environment_data";
+    message["version"] = 1;
+    message["device_id"] = config.deviceId;
+    message["data_type"] = kCombinedDataType;
+    message["timestamp"] = timestamp;
+    lastSequence = timestamp > lastSequence ? timestamp : lastSequence + 1;
+    message["sequence"] = lastSequence;
+    JsonObject data = message["data"].to<JsonObject>();
+    DynamicJsonDocument wifiDocument(kWifiSnapshotBufferSize);
+    DynamicJsonDocument bluetoothDocument(kBluetoothSnapshotBufferSize);
+    deserializeJson(wifiDocument, wifiCopy);
+    deserializeJson(bluetoothDocument, bluetoothCopy);
+    JsonObject wifiData = data["wifi"].to<JsonObject>();
+    JsonObject bluetoothData = data["bluetooth"].to<JsonObject>();
+    for (JsonPair pair : wifiDocument.as<JsonObject>()) wifiData[pair.key()] = pair.value();
+    for (JsonPair pair : bluetoothDocument.as<JsonObject>()) bluetoothData[pair.key()] = pair.value();
+
     String payload;
     serializeJson(message, payload);
     const bool sent = websocket.sendTXT(payload);
-    WiFi.scanDelete();
     if (sent && authenticated && websocket.isConnected()) {
         blinkConnected();
-        addLog(String("上传 WiFi: ") + count + " 个，序号=" + epochMillis);
+        addLog(String("上传组合快照：WiFi+") + (wifiReady ? "新" : "旧/空") + ", Bluetooth+" + (bluetoothReady ? "新" : "旧/空"));
     } else {
-        addLog("上传失败：WebSocket 未认证、已断开或发送失败");
+        addLog("上传组合快照失败");
     }
 }
 
@@ -767,6 +824,10 @@ void checkConfigButton() {
 
 void setup() {
     NimBLEDevice::init("");
+    snapshotMutex = xSemaphoreCreateMutex();
+    if (snapshotMutex) {
+        xTaskCreatePinnedToCore(scannerTask, "environment-scan", 8192, nullptr, 1, &scannerTaskHandle, 0);
+    }
     Serial.begin(115200);
     pinMode(kLedPin, OUTPUT);
     setLed(false);
@@ -799,13 +860,9 @@ void loop() {
         websocket.loop();
         maintainWebSocket();
         const uint32_t now = millis();
-        if (static_cast<int32_t>(now - nextBluetoothScanAt) >= 0) {
-            nextBluetoothScanAt = now + kBluetoothScanIntervalMs;
-            sendBluetoothData();
-        }
         if (static_cast<int32_t>(now - nextUploadAt) >= 0) {
             nextUploadAt = now + kUploadIntervalMs;
-            sendWifiData();
+            sendCombinedSnapshot();
         }
     }
     delay(10);
