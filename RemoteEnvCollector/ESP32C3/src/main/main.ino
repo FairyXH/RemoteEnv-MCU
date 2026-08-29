@@ -20,12 +20,13 @@ constexpr size_t kSessionTokenLength = 32;
 constexpr uint32_t kSessionTimeoutMs = 1800000;
 constexpr uint32_t kUploadIntervalMs = 3000;
 constexpr uint32_t kDefaultUploadIntervalSeconds = 15;
-constexpr uint32_t kMinimumUploadIntervalSeconds = 5;
+constexpr uint32_t kMinimumUploadIntervalSeconds = 10;
 constexpr uint32_t kMaximumUploadIntervalSeconds = 30;
-constexpr uint32_t kBluetoothScanDurationMs = 5000;
+constexpr uint32_t kMinimumScanSliceMs = 5000;
 constexpr size_t kWifiSnapshotBufferSize = 8192;
 constexpr size_t kBluetoothSnapshotBufferSize = 12288;
-constexpr char kCombinedDataType[] = "bluetooth_wifi";
+constexpr char kBluetoothDataType[] = "bluetooth";
+constexpr char kWifiDataType[] = "wifi";
 
 constexpr uint32_t kWifiConnectTimeoutMs = 15000;
 constexpr uint32_t kAuthTimeoutMs = 15000;
@@ -90,6 +91,9 @@ uint64_t wifiSnapshotAt = 0;
 uint64_t bluetoothSnapshotAt = 0;
 bool wifiSnapshotReady = false;
 bool bluetoothSnapshotReady = false;
+SemaphoreHandle_t snapshotMutex = nullptr;
+TaskHandle_t scanTaskHandle = nullptr;
+volatile bool scanTaskEnabled = false;
 
 void addLog(const String& message) {
     Serial.println(message);
@@ -327,14 +331,14 @@ uint64_t currentEpochMillis();
 void blinkConnected();
 String base64Encode(const uint8_t* data, size_t length);
 
-void scanBluetoothSnapshot() {
+void scanBluetoothSnapshot(uint32_t durationMs) {
     NimBLEScan* scanner = NimBLEDevice::getScan();
     scanner->setActiveScan(true);
     scanner->setInterval(100);
     scanner->setWindow(100);
     scanner->setMaxResults(100);
     scanner->setDuplicateFilter(1);
-    NimBLEScanResults results = scanner->getResults(kBluetoothScanDurationMs, false);
+    NimBLEScanResults results = scanner->getResults(durationMs, false);
     addLog(String("Bluetooth 扫描完成：") + results.getCount() + " 个");
 
     static DynamicJsonDocument document(12288);
@@ -400,9 +404,10 @@ void scanBluetoothSnapshot() {
     scanner->clearResults();
 }
 
-void scanWifiSnapshot() {
-    const int count = WiFi.scanNetworks(false, true);
-    addLog(String("WiFi 流扫描帧：") + count + " 个");
+void scanWifiSnapshot(uint32_t durationMs) {
+    const uint32_t perChannelMs = max<uint32_t>(100, durationMs / 14);
+    const int count = WiFi.scanNetworks(false, true, false, perChannelMs);
+    addLog(String("WiFi 扫描完成：") + count + " 个");
     static DynamicJsonDocument document(8192);
     document.clear();
     JsonArray networks = document["networks"].to<JsonArray>();
@@ -425,54 +430,58 @@ void scanWifiSnapshot() {
     WiFi.scanDelete();
 }
 
+void runScanCycle() {
+    const uint32_t intervalMs = constrain(uploadIntervalSeconds, kMinimumUploadIntervalSeconds, kMaximumUploadIntervalSeconds) * 1000UL;
+    const uint32_t bluetoothMs = intervalMs / 2;
+    const uint32_t wifiMs = intervalMs - bluetoothMs;
+    addLog(String("开始扫描周期：Bluetooth ") + bluetoothMs / 1000 + " 秒，WiFi " + wifiMs / 1000 + " 秒");
+    scanBluetoothSnapshot(bluetoothMs);
+    scanWifiSnapshot(wifiMs);
+}
+
+void sendEnvironmentData(const char* dataType, const char* dataJson, uint64_t sequence, uint64_t timestamp) {
+    static DynamicJsonDocument message(16384);
+    message.clear();
+    message["type"] = "environment_data";
+    message["version"] = 1;
+    message["device_id"] = config.deviceId;
+    message["data_type"] = dataType;
+    message["timestamp"] = timestamp;
+    message["sequence"] = sequence;
+    static StaticJsonDocument<12288> data;
+    data.clear();
+    if (deserializeJson(data, dataJson) != DeserializationError::Ok) {
+        addLog(String("数据解析失败：") + dataType);
+        return;
+    }
+    message["data"] = data.as<JsonObject>();
+    String payload;
+    serializeJson(message, payload);
+    const bool sent = websocket.sendTXT(payload);
+    addLog(String("上传 ") + dataType + (sent ? " 已发送" : " 发送失败"));
+}
+
 void sendCombinedSnapshot() {
     if (!authenticated || !websocket.isConnected()) {
-        addLog("组合快照跳过：WebSocket 未认证或已断开");
+        addLog("组合上传跳过：WebSocket 未认证或已断开");
         return;
     }
-    scanBluetoothSnapshot();
-    scanWifiSnapshot();
     const uint64_t timestamp = currentEpochMillis();
-    if (timestamp == 0) {
-        addLog("组合快照跳过：NTP 尚未同步");
-        return;
-    }
-
+    if (timestamp == 0) return;
     String wifiCopy(wifiSnapshot);
     String bluetoothCopy(bluetoothSnapshot);
     const bool wifiReady = wifiSnapshotReady;
     const bool bluetoothReady = bluetoothSnapshotReady;
     if (!wifiReady) wifiCopy = "{\"networks\":[]}";
     if (!bluetoothReady) bluetoothCopy = "{\"devices\":[]}";
-
-    static DynamicJsonDocument message(24576);
-    message.clear();
-    message["type"] = "environment_data";
-    message["version"] = 1;
-    message["device_id"] = config.deviceId;
-    message["data_type"] = kCombinedDataType;
-    message["timestamp"] = timestamp;
-    message["sequence"] = timestamp;
-    JsonObject data = message["data"].to<JsonObject>();
-    static DynamicJsonDocument wifiDocument(kWifiSnapshotBufferSize);
-    static DynamicJsonDocument bluetoothDocument(kBluetoothSnapshotBufferSize);
-    wifiDocument.clear();
-    bluetoothDocument.clear();
-    deserializeJson(wifiDocument, wifiCopy);
-    deserializeJson(bluetoothDocument, bluetoothCopy);
-    data["wifi"] = wifiDocument.as<JsonObject>();
-    data["bluetooth"] = bluetoothDocument.as<JsonObject>();
-
-    String payload;
-    serializeJson(message, payload);
-    const bool sent = websocket.sendTXT(payload);
-    if (sent && authenticated && websocket.isConnected()) {
-        blinkConnected();
-        addLog(String("上传组合快照：WiFi+") + (wifiReady ? "新" : "旧/空") + ", Bluetooth+" + (bluetoothReady ? "新" : "旧/空"));
-    } else {
-        addLog("上传组合快照失败");
-    }
+    static uint64_t bluetoothSequence = 0;
+    static uint64_t wifiSequence = 0;
+    bluetoothSequence = timestamp > bluetoothSequence ? timestamp : bluetoothSequence + 1;
+    wifiSequence = timestamp > wifiSequence ? timestamp : wifiSequence + 1;
+    sendEnvironmentData(kBluetoothDataType, bluetoothCopy.c_str(), bluetoothSequence, timestamp);
+    sendEnvironmentData(kWifiDataType, wifiCopy.c_str(), wifiSequence, timestamp);
 }
+
 
 void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
     switch (type) {
@@ -619,7 +628,7 @@ void handleConfigPage() {
     page += F("<label>WiFi 密码<input name='password' type='password' maxlength='63' value='"); page += htmlEscape(config.wifiPassword); page += F("'></label>");
     page += F("<label>WS 地址<input name='ws' maxlength='159' required value='"); page += htmlEscape(config.wsUrl); page += F("'></label>");
     page += F("<label>Token<input name='token' maxlength='159' required value='"); page += htmlEscape(config.token); page += F("'></label>");
-    page += F("<label>设备 ID<input name='device' maxlength='63' required value='"); page += htmlEscape(config.deviceId); page += F("'></label><label>上传间隔（秒，5-30）<input name='interval' type='number' min='5' max='30' required value='"); page += uploadIntervalSeconds; page += F("'></label><label>新管理密码<input name='newPassword' type='password' minlength='8' maxlength='96' placeholder='留空则保持不变'></label><label>确认新管理密码<input name='confirmPassword' type='password' minlength='8' maxlength='96' placeholder='留空则保持不变'></label><button type='submit'>保存配置</button></form><p><a href='/panel'>打开运行面板</a> · <form method='post' action='/logout' style='display:inline'><button type='submit' style='width:auto;margin:0;padding:4px 10px;background:#68737d'>退出登录</button></form></p></main></body></html>");
+    page += F("<label>设备 ID<input name='device' maxlength='63' required value='"); page += htmlEscape(config.deviceId); page += F("'></label><label>上传间隔（秒，10-30）<input name='interval' type='number' min='10' max='30' required value='"); page += uploadIntervalSeconds; page += F("'></label><label>新管理密码<input name='newPassword' type='password' minlength='8' maxlength='96' placeholder='留空则保持不变'></label><label>确认新管理密码<input name='confirmPassword' type='password' minlength='8' maxlength='96' placeholder='留空则保持不变'></label><button type='submit'>保存配置</button></form><p><a href='/panel'>打开运行面板</a> · <form method='post' action='/logout' style='display:inline'><button type='submit' style='width:auto;margin:0;padding:4px 10px;background:#68737d'>退出登录</button></form></p></main></body></html>");
     webServer.send(200, "text/html; charset=utf-8", page);
 }
 
@@ -639,7 +648,7 @@ void handlePanel() {
     page += F("<br>WiFi："); page += WiFi.status() == WL_CONNECTED ? F("已连接 ") : F("未连接 ");
     page += WiFi.localIP().toString();
     page += F("<br>WebSocket："); page += (authenticated && websocket.isConnected()) ? F("传输已连接，认证成功") : F("未连接或未认证");
-    page += F("<br>设备 ID："); page += htmlEscape(config.deviceId);    page += F("</p><h2>最近日志</h2><pre>");
+    page += F("<br>设备 ID："); page += htmlEscape(config.deviceId); page += F("</p><p>扫描与上传间隔："); page += uploadIntervalSeconds; page += F(" 秒</p><h2>最近日志</h2><pre>");
     for (uint8_t i = 0; i < logCount; ++i) { page += htmlEscape(String(logLines[i])); page += '\n'; }
     page += F("</pre><p><a href='/'>配置页面</a> · <form method='post' action='/logout' style='display:inline'><button type='submit' style='width:auto;margin:0;padding:4px 10px;background:#68737d'>退出登录</button></form></p></main></body></html>");
     webServer.send(200, "text/html; charset=utf-8", page);
@@ -877,6 +886,7 @@ void loop() {
         const uint32_t now = millis();
         if (static_cast<int32_t>(now - nextUploadAt) >= 0) {
             nextUploadAt = now + uploadIntervalSeconds * 1000UL;
+            runScanCycle();
             sendCombinedSnapshot();
         }
     }
