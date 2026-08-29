@@ -10,7 +10,7 @@
 #include <time.h>
 
 namespace {
-constexpr uint8_t kLedPin = LED_BUILTIN;
+constexpr uint8_t kLedPin = 8;  // This board's onboard LED
 constexpr uint8_t kConfigButtonPin = 0;  // GPIO0, active low
 constexpr size_t kEepromSize = 640;
 constexpr uint32_t kConfigMagic = 0x52454332;
@@ -88,6 +88,7 @@ uint64_t bluetoothSnapshotAt = 0;
 bool wifiSnapshotReady = false;
 bool bluetoothSnapshotReady = false;
 TaskHandle_t scannerTaskHandle = nullptr;
+volatile bool scannerEnabled = false;
 
 void addLog(const String& message) {
     Serial.println(message);
@@ -404,6 +405,10 @@ void updateWifiSnapshot() {
 
 void scannerTask(void*) {
     for (;;) {
+        if (!scannerEnabled || WiFi.status() != WL_CONNECTED) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
         updateBluetoothSnapshot();
         vTaskDelay(pdMS_TO_TICKS(kSnapshotScanPauseMs));
         updateWifiSnapshot();
@@ -708,6 +713,7 @@ void startConfigMode() {
         return;
     }
     configMode = true;
+    scannerEnabled = false;
     configModeStartedAt = millis();
     lastConfigActivityAt = configModeStartedAt;
     authenticated = false;
@@ -746,24 +752,24 @@ void maintainWifi() {
             if (!webServerStarted) startLocalWebServer();
             nextWebSocketRetryAt = now;
         }
+        scannerEnabled = true;
         return;
     }
+    scannerEnabled = false;
     authenticated = false;
-    if (WiFi.status() != WL_CONNECTED) {
-        if (webSocketStarted) {
-            websocket.disconnect();
-            webSocketStarted = false;
-        }
-        if (wifiConnecting && now - wifiAttemptStartedAt < kWifiConnectTimeoutMs) return;
-        if (wifiConnecting) {
-            wifiConnecting = false;
-            addLog("WiFi 连接失败，5 秒后无限重试");
-            WiFi.disconnect();
-        }
-        if (static_cast<int32_t>(now - nextWifiRetryAt) >= 0) {
-            nextWifiRetryAt = now + kWifiRetryIntervalMs;
-            beginWifiAttempt();
-        }
+    if (webSocketStarted) {
+        websocket.disconnect();
+        webSocketStarted = false;
+    }
+    if (wifiConnecting && now - wifiAttemptStartedAt < kWifiConnectTimeoutMs) return;
+    if (wifiConnecting) {
+        wifiConnecting = false;
+        addLog("WiFi 连接失败，5 秒后无限重试");
+        WiFi.disconnect();
+    }
+    if (static_cast<int32_t>(now - nextWifiRetryAt) >= 0) {
+        nextWifiRetryAt = now + kWifiRetryIntervalMs;
+        beginWifiAttempt();
     }
 }
 
@@ -815,6 +821,7 @@ void checkConfigButton() {
     if (state != lastButtonState) {
         lastButtonState = state;
         lastButtonChangeAt = millis();
+        addLog(state == LOW ? "GPIO0 按键按下" : "GPIO0 按键释放");
     }
     if (state == LOW && millis() - lastButtonChangeAt >= 40) {
         startConfigMode();
@@ -823,21 +830,25 @@ void checkConfigButton() {
 }  // namespace
 
 void setup() {
+    Serial.begin(115200);
+    delay(100);
+    Serial.println("RemoteEnv ESP32-C3 boot");
+    pinMode(kLedPin, OUTPUT);
+    setLed(false);
+    pinMode(kConfigButtonPin, INPUT_PULLUP);
+    Serial.printf("LED GPIO=%u, GPIO0=%s\n", kLedPin, digitalRead(kConfigButtonPin) == LOW ? "LOW" : "HIGH");
     NimBLEDevice::init("");
     snapshotMutex = xSemaphoreCreateMutex();
     if (snapshotMutex) {
         xTaskCreatePinnedToCore(scannerTask, "environment-scan", 8192, nullptr, 1, &scannerTaskHandle, 0);
     }
-    Serial.begin(115200);
-    pinMode(kLedPin, OUTPUT);
-    setLed(false);
-    pinMode(kConfigButtonPin, INPUT_PULLUP);
     loadConfig();
 
     if (!hasConfig() || digitalRead(kConfigButtonPin) == LOW) {
         startConfigMode();
         return;
     }
+    scannerEnabled = true;
     beginWifiAttempt();
     startLocalWebServer();
 }
