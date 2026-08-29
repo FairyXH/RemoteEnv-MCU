@@ -441,8 +441,6 @@ void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
     }
 }
 
-const char kConfigPage[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RemoteEnv 配置</title><style>body{font-family:system-ui,sans-serif;background:#f3f5f7;margin:0;padding:24px;color:#17202a}main{max-width:520px;margin:auto;background:white;padding:24px;border-radius:12px;box-shadow:0 4px 18px #0002}h1{font-size:22px}label{display:block;margin-top:16px;font-weight:600}input{box-sizing:border-box;width:100%;padding:11px;margin-top:6px;border:1px solid #bbc4cc;border-radius:7px;font-size:15px}button{width:100%;margin-top:24px;padding:12px;border:0;border-radius:7px;background:#1769aa;color:white;font-size:16px}p{color:#5d6872;font-size:14px;line-height:1.5}</style></head><body><main><h1>ESP32-C3 环境采集器配置</h1><p>保存后设备会自动重启。WS 地址请输入完整格式，例如 wss://10.0.0.10:8000/ws。</p><form method="post" action="/save"><label>WiFi 名称<input name="ssid" maxlength="63" required></label><label>WiFi 密码<input name="password" type="password" maxlength="63"></label><label>WS 地址<input name="ws" maxlength="159" required></label><label>Token<input name="token" maxlength="159" required></label><label>设备 ID<input name="device" maxlength="63" required></label><button type="submit">保存并重启</button></form></main></body></html>)HTML";
-
 String htmlEscape(const char* value) {
     String result(value);
     result.replace("&", "&amp;");
