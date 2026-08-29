@@ -22,6 +22,7 @@ constexpr uint32_t kUploadIntervalMs = 3000;
 constexpr uint32_t kDefaultUploadIntervalSeconds = 15;
 constexpr uint32_t kMinimumUploadIntervalSeconds = 5;
 constexpr uint32_t kMaximumUploadIntervalSeconds = 30;
+constexpr uint32_t kBluetoothScanDurationMs = 5000;
 constexpr size_t kWifiSnapshotBufferSize = 8192;
 constexpr size_t kBluetoothSnapshotBufferSize = 12288;
 constexpr char kCombinedDataType[] = "bluetooth_wifi";
@@ -329,10 +330,12 @@ String base64Encode(const uint8_t* data, size_t length);
 void scanBluetoothSnapshot() {
     NimBLEScan* scanner = NimBLEDevice::getScan();
     scanner->setActiveScan(true);
-    scanner->setInterval(45);
-    scanner->setWindow(15);
-    NimBLEScanResults results = scanner->getResults(1, false);
-    addLog(String("Bluetooth 流扫描帧：") + results.getCount() + " 个");
+    scanner->setInterval(100);
+    scanner->setWindow(100);
+    scanner->setMaxResults(100);
+    scanner->setDuplicateFilter(1);
+    NimBLEScanResults results = scanner->getResults(kBluetoothScanDurationMs, false);
+    addLog(String("Bluetooth 扫描完成：") + results.getCount() + " 个");
 
     static DynamicJsonDocument document(12288);
     document.clear();
@@ -355,18 +358,35 @@ void scanBluetoothSnapshot() {
                 item["uuid"] = device->getServiceUUID(0).toString().c_str();
             }
         }
+        if (device->haveServiceData()) {
+            JsonObject serviceData = item["serviceData"].to<JsonObject>();
+            for (uint8_t j = 0; j < device->getServiceDataCount(); ++j) {
+                const std::string raw = device->getServiceData(j);
+                String hex;
+                for (uint8_t byte : raw) {
+                    if (byte < 16) hex += '0';
+                    hex += String(byte, HEX);
+                }
+                serviceData[device->getServiceDataUUID(j).toString().c_str()] = hex;
+            }
+        }
         if (device->haveManufacturerData()) {
             JsonObject manufacturers = item["manufacturerData"].to<JsonObject>();
-            const std::string raw = device->getManufacturerData();
-            String hex;
-            for (uint8_t byte : raw) {
-                if (byte < 16) hex += '0';
-                hex += String(byte, HEX);
+            String combinedHex;
+            String combinedRaw;
+            for (uint8_t j = 0; j < device->getManufacturerDataCount(); ++j) {
+                const std::string raw = device->getManufacturerData(j);
+                String hex;
+                for (uint8_t byte : raw) {
+                    if (byte < 16) hex += '0';
+                    hex += String(byte, HEX);
+                }
+                manufacturers[String(j)] = hex;
+                combinedHex += hex;
+                combinedRaw += String(raw.c_str());
             }
-            manufacturers["0"] = hex;
-            item["rawHex"] = hex;
-            item["rawLength"] = raw.length();
-            item["raw"] = base64Encode(reinterpret_cast<const uint8_t*>(raw.data()), raw.length());
+            item["rawHex"] = combinedHex;
+            item["rawLength"] = combinedRaw.length() / 2;
         }
     }
     String encoded;
