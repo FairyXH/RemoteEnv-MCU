@@ -40,23 +40,16 @@ struct DeviceConfig {
 
 struct StoredConfig {
     uint32_t magic;
-    
-String getChipIdHex() {
-    const uint64_t chipId = ESP.getEfuseMac();
-    char value[17]{};
-    snprintf(value, sizeof(value), "%04x%08x", static_cast<uint16_t>(chipId >> 32), static_cast<uint32_t>(chipId));
-    return String(value);
-}
-DeviceConfig config;
+    DeviceConfig config;
 };
 
-
 String getChipIdHex() {
     const uint64_t chipId = ESP.getEfuseMac();
     char value[17]{};
     snprintf(value, sizeof(value), "%04x%08x", static_cast<uint16_t>(chipId >> 32), static_cast<uint32_t>(chipId));
     return String(value);
 }
+
 DeviceConfig config;
 WebSocketsClient websocket;
 WebServer webServer(80);
@@ -125,7 +118,7 @@ uint32_t sessionCreatedAt = 0;
 void createSession() {
     char token[kSessionTokenLength + 1]{};
     for (uint8_t i = 0; i < kSessionTokenLength / 2; ++i) {
-        const uint8_t value = static_cast<uint8_t>(ESP.random());
+        const uint8_t value = static_cast<uint8_t>(esp_random());
         snprintf(token + i * 2, 3, "%02x", value);
     }
     sessionToken = token;
@@ -626,7 +619,8 @@ void handleSaveConfig() {
 void registerWebRoutes() {
     if (webRoutesRegistered) return;
     webRoutesRegistered = true;
-    webServer.collectHeaders("Cookie");
+    const char* headerKeys[] = {"Cookie"};
+    webServer.collectHeaders(headerKeys, 1);
     webServer.on("/", HTTP_GET, handleConfigPage);
     webServer.on("/login", HTTP_GET, []() { sendLoginPage(); });
     webServer.on("/login", HTTP_POST, handleLogin);
