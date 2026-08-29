@@ -327,6 +327,16 @@ String base64Encode(const uint8_t* data, size_t length) {
     }
     return output;
 }
+
+String bytesToHex(const uint8_t* data, size_t length) {
+    String output;
+    output.reserve(length * 2);
+    for (size_t i = 0; i < length; ++i) {
+        if (data[i] < 16) output += '0';
+        output += String(data[i], HEX);
+    }
+    return output;
+}
 uint64_t currentEpochMillis();
 void blinkConnected();
 String base64Encode(const uint8_t* data, size_t length);
@@ -352,6 +362,14 @@ void scanBluetoothSnapshot(uint32_t durationMs) {
         item["address"] = device->getAddress().toString().c_str();
         item["rssi"] = device->getRSSI();
         item["mode"] = "ble";
+        item["addressType"] = device->getAddressType();
+        item["advType"] = device->getAdvType();
+        item["advFlags"] = device->getAdvFlags();
+        item["advLength"] = device->getAdvLength();
+        item["connectable"] = device->isConnectable();
+        item["scannable"] = device->isScannable();
+        if (device->haveAppearance()) item["appearance"] = device->getAppearance();
+        if (device->haveURI()) item["uri"] = device->getURI().c_str();
         if (device->haveTXPower()) item["txPower"] = device->getTXPower();
         if (device->haveServiceUUID()) {
             JsonArray uuids = item["serviceUuids"].to<JsonArray>();
@@ -376,22 +394,20 @@ void scanBluetoothSnapshot(uint32_t durationMs) {
         }
         if (device->haveManufacturerData()) {
             JsonObject manufacturers = item["manufacturerData"].to<JsonObject>();
-            String combinedHex;
-            String combinedRaw;
             for (uint8_t j = 0; j < device->getManufacturerDataCount(); ++j) {
                 const std::string raw = device->getManufacturerData(j);
-                String hex;
-                for (uint8_t byte : raw) {
-                    if (byte < 16) hex += '0';
-                    hex += String(byte, HEX);
-                }
-                manufacturers[String(j)] = hex;
-                combinedHex += hex;
-                combinedRaw += String(raw.c_str());
+                const String hex = bytesToHex(reinterpret_cast<const uint8_t*>(raw.data()), raw.length());
+                const String companyId = raw.length() >= 2
+                    ? String(static_cast<uint16_t>(static_cast<uint8_t>(raw[0])) |
+                             (static_cast<uint16_t>(static_cast<uint8_t>(raw[1])) << 8))
+                    : String(j);
+                manufacturers[companyId] = hex;
             }
-            item["rawHex"] = combinedHex;
-            item["rawLength"] = combinedRaw.length() / 2;
         }
+        const std::vector<uint8_t>& rawAdvertisement = device->getPayload();
+        item["rawHex"] = bytesToHex(rawAdvertisement.data(), rawAdvertisement.size());
+        item["rawLength"] = rawAdvertisement.size();
+        item["raw"] = base64Encode(rawAdvertisement.data(), rawAdvertisement.size());
     }
     String encoded;
     serializeJson(document, encoded);
@@ -418,6 +434,8 @@ void scanWifiSnapshot(uint32_t durationMs) {
         network["rssi"] = WiFi.RSSI(i);
         network["channel"] = WiFi.channel(i);
         network["encryption"] = static_cast<int>(WiFi.encryptionType(i));
+        network["frequency"] = WiFi.channel(i) <= 14 ? 2407 + WiFi.channel(i) * 5 : 5000 + WiFi.channel(i) * 5;
+        network["capabilities"] = static_cast<int>(WiFi.encryptionType(i));
     }
     String encoded;
     serializeJson(document, encoded);
