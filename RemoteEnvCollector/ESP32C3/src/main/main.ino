@@ -334,7 +334,8 @@ void scanBluetoothSnapshot() {
     NimBLEScanResults results = scanner->getResults(1, false);
     addLog(String("Bluetooth 流扫描帧：") + results.getCount() + " 个");
 
-    DynamicJsonDocument document(12288);
+    static DynamicJsonDocument document(12288);
+    document.clear();
     JsonArray devices = document["devices"].to<JsonArray>();
     const int count = results.getCount();
     for (int i = 0; i < count; ++i) {
@@ -382,7 +383,8 @@ void scanBluetoothSnapshot() {
 void scanWifiSnapshot() {
     const int count = WiFi.scanNetworks(false, true);
     addLog(String("WiFi 流扫描帧：") + count + " 个");
-    DynamicJsonDocument document(8192);
+    static DynamicJsonDocument document(8192);
+    document.clear();
     JsonArray networks = document["networks"].to<JsonArray>();
     for (int i = 0; i < count; ++i) {
         JsonObject network = networks.add<JsonObject>();
@@ -416,18 +418,15 @@ void sendCombinedSnapshot() {
         return;
     }
 
-    char wifiCopy[kWifiSnapshotBufferSize];
-    char bluetoothCopy[kBluetoothSnapshotBufferSize];
-    bool wifiReady = false;
-    bool bluetoothReady = false;
-    memcpy(wifiCopy, wifiSnapshot, wifiSnapshotLength + 1);
-    memcpy(bluetoothCopy, bluetoothSnapshot, bluetoothSnapshotLength + 1);
-    wifiReady = wifiSnapshotReady;
-    bluetoothReady = bluetoothSnapshotReady;
-    if (!wifiReady) strcpy(wifiCopy, "{\"networks\":[]}");
-    if (!bluetoothReady) strcpy(bluetoothCopy, "{\"devices\":[]}");
+    String wifiCopy(wifiSnapshot);
+    String bluetoothCopy(bluetoothSnapshot);
+    const bool wifiReady = wifiSnapshotReady;
+    const bool bluetoothReady = bluetoothSnapshotReady;
+    if (!wifiReady) wifiCopy = "{\"networks\":[]}";
+    if (!bluetoothReady) bluetoothCopy = "{\"devices\":[]}";
 
-    DynamicJsonDocument message(24576);
+    static DynamicJsonDocument message(24576);
+    message.clear();
     message["type"] = "environment_data";
     message["version"] = 1;
     message["device_id"] = config.deviceId;
@@ -435,8 +434,10 @@ void sendCombinedSnapshot() {
     message["timestamp"] = timestamp;
     message["sequence"] = timestamp;
     JsonObject data = message["data"].to<JsonObject>();
-    DynamicJsonDocument wifiDocument(kWifiSnapshotBufferSize);
-    DynamicJsonDocument bluetoothDocument(kBluetoothSnapshotBufferSize);
+    static DynamicJsonDocument wifiDocument(kWifiSnapshotBufferSize);
+    static DynamicJsonDocument bluetoothDocument(kBluetoothSnapshotBufferSize);
+    wifiDocument.clear();
+    bluetoothDocument.clear();
     deserializeJson(wifiDocument, wifiCopy);
     deserializeJson(bluetoothDocument, bluetoothCopy);
     data["wifi"] = wifiDocument.as<JsonObject>();
