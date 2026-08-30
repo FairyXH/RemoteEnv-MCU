@@ -13,9 +13,12 @@
 namespace {
 constexpr uint8_t kLedPin = 8;  // This board's onboard LED
 constexpr uint8_t kConfigButtonPin = 0;  // GPIO0, active low
-constexpr size_t kEepromSize = 640;
-constexpr uint32_t kConfigMagic = 0x52454333;
-constexpr uint32_t kPreviousConfigMagic = 0x52454332;
+constexpr size_t kEepromSize = 4096;
+constexpr uint32_t kConfigMagic = 0x52454334;
+constexpr uint32_t kPreviousConfigMagic = 0x52454333;
+constexpr uint32_t kOlderConfigMagic = 0x52454332;
+constexpr uint8_t kMaxWifiNetworks = 5;
+constexpr uint8_t kMaxServers = 3;
 constexpr size_t kPasswordHashLength = 64;
 constexpr size_t kSessionTokenLength = 32;
 constexpr uint32_t kSessionTimeoutMs = 1800000;
@@ -33,18 +36,27 @@ constexpr uint32_t kWifiConnectTimeoutMs = 15000;
 constexpr uint32_t kAuthTimeoutMs = 15000;
 constexpr uint32_t kApplicationPingIntervalMs = 10000;
 constexpr uint32_t kConfigModeTimeoutMs = 300000;
-constexpr uint32_t kWifiRetryIntervalMs = 5000;
+constexpr uint32_t kWifiRetryBaseIntervalMs = 5000;
+constexpr uint32_t kWifiRetryMaximumIntervalMs = 60000;
 constexpr uint32_t kWebSocketRetryIntervalMs = 5000;
 constexpr uint8_t kLogCapacity = 20;
 constexpr uint8_t kLogLineLength = 96;
 constexpr time_t kMinimumValidEpoch = 1700000000;
 constexpr char kApPassword[] = "12345678";
 
-struct DeviceConfig {
-    char wifiSsid[64];
-    char wifiPassword[64];
+struct WifiConfig {
+    char ssid[64];
+    char password[64];
+};
+
+struct ServerConfig {
     char wsUrl[160];
     char token[160];
+};
+
+struct DeviceConfig {
+    WifiConfig wifi[kMaxWifiNetworks];
+    ServerConfig servers[kMaxServers];
     char deviceId[64];
     char passwordHash[65];
     uint32_t uploadIntervalSeconds;
@@ -55,6 +67,21 @@ struct StoredConfig {
     DeviceConfig config;
 };
 
+struct LegacyDeviceConfig {
+    char wifiSsid[64];
+    char wifiPassword[64];
+    char wsUrl[160];
+    char token[160];
+    char deviceId[64];
+    char passwordHash[65];
+    uint32_t uploadIntervalSeconds;
+};
+
+struct LegacyStoredConfig {
+    uint32_t magic;
+    LegacyDeviceConfig config;
+};
+
 String getChipIdHex() {
     const uint64_t chipId = ESP.getEfuseMac();
     char value[17]{};
@@ -63,27 +90,30 @@ String getChipIdHex() {
 }
 
 DeviceConfig config;
-WebSocketsClient websocket;
+WebSocketsClient websockets[kMaxServers];
 WebServer webServer(80);
 uint32_t nextUploadAt = 0;
 uint32_t uploadIntervalSeconds = kDefaultUploadIntervalSeconds;
-bool authenticated = false;
+bool serverAuthenticated[kMaxServers]{};
 bool configMode = false;
 bool lastButtonState = HIGH;
 uint32_t lastButtonChangeAt = 0;
-uint32_t connectedAt = 0;
-uint32_t lastApplicationPingAt = 0;
 char logLines[kLogCapacity][kLogLineLength];
 uint8_t logCount = 0;
 uint32_t configModeStartedAt = 0;
 uint32_t lastConfigActivityAt = 0;
 uint32_t wifiAttemptStartedAt = 0;
 uint32_t nextWifiRetryAt = 0;
-uint32_t nextWebSocketRetryAt = 0;
+uint32_t wifiRetryDelayMs = kWifiRetryBaseIntervalMs;
+uint8_t wifiIndex = 0;
+uint8_t wifiRound = 0;
+uint32_t nextWebSocketRetryAt[kMaxServers]{};
 bool webServerStarted = false;
 bool webRoutesRegistered = false;
 bool wifiConnecting = false;
-bool webSocketStarted = false;
+bool webSocketStarted[kMaxServers]{};
+uint32_t connectedAt[kMaxServers]{};
+uint32_t lastApplicationPingAt[kMaxServers]{};
 char wifiSnapshot[kWifiSnapshotBufferSize] = "{\"networks\":[]}";
 char bluetoothSnapshot[kBluetoothSnapshotBufferSize] = "{\"devices\":[]}";
 size_t wifiSnapshotLength = sizeof("{\"networks\":[]}") - 1;
@@ -201,9 +231,20 @@ void setLed(bool on) {
     digitalWrite(kLedPin, on ? LOW : HIGH);
 }
 
+uint8_t wifiCount() {
+    uint8_t count = 0;
+    while (count < kMaxWifiNetworks && config.wifi[count].ssid[0] != '\0') ++count;
+    return count;
+}
+
+uint8_t serverCount() {
+    uint8_t count = 0;
+    while (count < kMaxServers && config.servers[count].wsUrl[0] != '\0') ++count;
+    return count;
+}
+
 bool hasConfig() {
-    return config.wifiSsid[0] != '\0' && config.wsUrl[0] != '\0' &&
-           config.token[0] != '\0' && config.deviceId[0] != '\0';
+    return wifiCount() > 0 && serverCount() > 0 && config.deviceId[0] != '\0';
 }
 
 void copyField(char* destination, size_t capacity, const String& value) {
@@ -218,22 +259,34 @@ void loadConfig() {
     StoredConfig stored{};
     EEPROM.get(0, stored);
     legacyConfig = stored.magic == 0x52454331;
-    if (legacyConfig || stored.magic == kConfigMagic || stored.magic == kPreviousConfigMagic) {
+    if (stored.magic == kConfigMagic) {
         config = stored.config;
-        if (stored.magic == kPreviousConfigMagic) config.uploadIntervalSeconds = kDefaultUploadIntervalSeconds;
-        if (legacyConfig) {
-            memset(config.passwordHash, 0, sizeof(config.passwordHash));
-        }
-        config.wifiSsid[sizeof(config.wifiSsid) - 1] = '\0';
-        config.wifiPassword[sizeof(config.wifiPassword) - 1] = '\0';
-        config.wsUrl[sizeof(config.wsUrl) - 1] = '\0';
-        config.token[sizeof(config.token) - 1] = '\0';
-        config.deviceId[sizeof(config.deviceId) - 1] = '\0';
-        config.passwordHash[sizeof(config.passwordHash) - 1] = '\0';
+    } else if (stored.magic == kPreviousConfigMagic || stored.magic == kOlderConfigMagic || legacyConfig) {
+        LegacyStoredConfig legacy{};
+        EEPROM.get(0, legacy);
+        memset(&config, 0, sizeof(config));
+        copyField(config.wifi[0].ssid, sizeof(config.wifi[0].ssid), legacy.config.wifiSsid);
+        copyField(config.wifi[0].password, sizeof(config.wifi[0].password), legacy.config.wifiPassword);
+        copyField(config.servers[0].wsUrl, sizeof(config.servers[0].wsUrl), legacy.config.wsUrl);
+        copyField(config.servers[0].token, sizeof(config.servers[0].token), legacy.config.token);
+        copyField(config.deviceId, sizeof(config.deviceId), legacy.config.deviceId);
+        copyField(config.passwordHash, sizeof(config.passwordHash), legacy.config.passwordHash);
+        config.uploadIntervalSeconds = legacy.config.uploadIntervalSeconds;
+        if (legacyConfig) memset(config.passwordHash, 0, sizeof(config.passwordHash));
     } else {
         memset(&config, 0, sizeof(config));
         config.uploadIntervalSeconds = kDefaultUploadIntervalSeconds;
     }
+    for (uint8_t i = 0; i < kMaxWifiNetworks; ++i) {
+        config.wifi[i].ssid[sizeof(config.wifi[i].ssid) - 1] = '\0';
+        config.wifi[i].password[sizeof(config.wifi[i].password) - 1] = '\0';
+    }
+    for (uint8_t i = 0; i < kMaxServers; ++i) {
+        config.servers[i].wsUrl[sizeof(config.servers[i].wsUrl) - 1] = '\0';
+        config.servers[i].token[sizeof(config.servers[i].token) - 1] = '\0';
+    }
+        config.deviceId[sizeof(config.deviceId) - 1] = '\0';
+        config.passwordHash[sizeof(config.passwordHash) - 1] = '\0';
     if (config.uploadIntervalSeconds < kMinimumUploadIntervalSeconds || config.uploadIntervalSeconds > kMaximumUploadIntervalSeconds) {
         config.uploadIntervalSeconds = kDefaultUploadIntervalSeconds;
     }
@@ -294,11 +347,11 @@ bool parseWsUrl(const char* url, String& host, uint16_t& port, String& path, boo
     return host.length() > 0;
 }
 
-void sendAuth() {
+void sendAuth(uint8_t serverIndex) {
     StaticJsonDocument<512> message;
     message["type"] = "auth";
     message["role"] = "collector";
-    message["token"] = config.token;
+    message["token"] = config.servers[serverIndex].token;
     message["device_id"] = config.deviceId;
     JsonObject device = message["device"].to<JsonObject>();
     device["name"] = "ESP32-C3 WiFi/Bluetooth Collector";
@@ -309,8 +362,8 @@ void sendAuth() {
 
     String payload;
     serializeJson(message, payload);
-    websocket.sendTXT(payload);
-    addLog("发送 WebSocket 认证");
+    websockets[serverIndex].sendTXT(payload);
+    addLog(String("服务器 ") + (serverIndex + 1) + " 发送 WebSocket 认证");
 }
 
 uint64_t currentEpochMillis() {
@@ -324,7 +377,9 @@ uint64_t currentEpochMillis() {
 }
 
 void blinkConnected() {
-    if (!authenticated || !websocket.isConnected()) {
+    bool connected = false;
+    for (uint8_t i = 0; i < kMaxServers; ++i) connected |= serverAuthenticated[i] && websockets[i].isConnected();
+    if (!connected) {
         return;
     }
     setLed(true);
@@ -480,6 +535,13 @@ void runScanCycle() {
     scanWifiSnapshot(wifiMs);
 }
 
+void startWebSocket(uint8_t serverIndex);
+void maintainWebSocket();
+void onWebSocketEvent(uint8_t serverIndex, WStype_t type, uint8_t* payload, size_t length);
+void onWebSocketEvent0(WStype_t type, uint8_t* payload, size_t length);
+void onWebSocketEvent1(WStype_t type, uint8_t* payload, size_t length);
+void onWebSocketEvent2(WStype_t type, uint8_t* payload, size_t length);
+
 void sendEnvironmentData(const char* dataType, const char* dataJson, uint64_t sequence, uint64_t timestamp) {
     static DynamicJsonDocument message(16384);
     message.clear();
@@ -498,13 +560,18 @@ void sendEnvironmentData(const char* dataType, const char* dataJson, uint64_t se
     message["data"] = data.as<JsonObject>();
     String payload;
     serializeJson(message, payload);
-    const bool sent = websocket.sendTXT(payload);
-    addLog(String("上传 ") + dataType + (sent ? " 已发送" : " 发送失败"));
+    for (uint8_t i = 0; i < kMaxServers; ++i) {
+        if (!serverAuthenticated[i] || !websockets[i].isConnected()) continue;
+        const bool sent = websockets[i].sendTXT(payload);
+        addLog(String("服务器 ") + (i + 1) + " 上传 " + dataType + (sent ? " 已发送" : " 发送失败"));
+    }
 }
 
 void sendCombinedSnapshot() {
-    if (!authenticated || !websocket.isConnected()) {
-        addLog("组合上传跳过：WebSocket 未认证或已断开");
+    bool anyServerReady = false;
+    for (uint8_t i = 0; i < kMaxServers; ++i) anyServerReady |= serverAuthenticated[i] && websockets[i].isConnected();
+    if (!anyServerReady) {
+        addLog("组合上传跳过：没有已认证服务器");
         return;
     }
     const uint64_t timestamp = currentEpochMillis();
@@ -522,21 +589,21 @@ void sendCombinedSnapshot() {
 }
 
 
-void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
+void onWebSocketEvent(uint8_t serverIndex, WStype_t type, uint8_t* payload, size_t length) {
     switch (type) {
         case WStype_CONNECTED:
-            authenticated = false;
-            connectedAt = millis();
-            lastApplicationPingAt = millis() + kApplicationPingIntervalMs;
-            addLog("WebSocket 已连接，发送认证");
-            sendAuth();
+            serverAuthenticated[serverIndex] = false;
+            connectedAt[serverIndex] = millis();
+            lastApplicationPingAt[serverIndex] = millis() + kApplicationPingIntervalMs;
+            addLog(String("服务器 ") + (serverIndex + 1) + " WebSocket 已连接，发送认证");
+            sendAuth(serverIndex);
             break;
         case WStype_DISCONNECTED:
-            authenticated = false;
-            connectedAt = 0;
-            webSocketStarted = false;
-            nextWebSocketRetryAt = millis() + kWebSocketRetryIntervalMs;
-            addLog("WebSocket 已断开，5 秒后无限重连");
+            serverAuthenticated[serverIndex] = false;
+            connectedAt[serverIndex] = 0;
+            webSocketStarted[serverIndex] = false;
+            nextWebSocketRetryAt[serverIndex] = millis() + kWebSocketRetryIntervalMs;
+            addLog(String("服务器 ") + (serverIndex + 1) + " WebSocket 已断开，等待重连");
             break;
         case WStype_PONG:
             addLog("收到 WebSocket Pong");
@@ -549,10 +616,10 @@ void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
             }
             const char* messageType = message["type"] | "";
             if (strcmp(messageType, "auth_result") == 0) {
-                authenticated = message["success"] | false;
-                addLog(authenticated ? "WebSocket 认证成功" : "WebSocket 认证失败");
+                serverAuthenticated[serverIndex] = message["success"] | false;
+                addLog(String("服务器 ") + (serverIndex + 1) + (serverAuthenticated[serverIndex] ? " WebSocket 认证成功" : " WebSocket 认证失败"));
             } else if (strcmp(messageType, "ping") == 0) {
-                websocket.sendTXT("{\"type\":\"ping\"}");
+                websockets[serverIndex].sendTXT("{\"type\":\"ping\"}");
                 addLog("收到应用层 Ping，已回复");
             }
             break;
@@ -561,6 +628,10 @@ void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
             break;
     }
 }
+
+void onWebSocketEvent0(WStype_t type, uint8_t* payload, size_t length) { onWebSocketEvent(0, type, payload, length); }
+void onWebSocketEvent1(WStype_t type, uint8_t* payload, size_t length) { onWebSocketEvent(1, type, payload, length); }
+void onWebSocketEvent2(WStype_t type, uint8_t* payload, size_t length) { onWebSocketEvent(2, type, payload, length); }
 
 String htmlEscape(const char* value) {
     String result(value);
@@ -663,10 +734,14 @@ void handleConfigPage() {
     String page;
     page.reserve(5000);
     page += F("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>RemoteEnv 配置</title><style>body{font-family:system-ui,sans-serif;background:#f3f5f7;margin:0;padding:24px;color:#17202a}main{max-width:560px;margin:auto;background:white;padding:24px;border-radius:12px;box-shadow:0 4px 18px #0002}h1{font-size:22px}label{display:block;margin-top:16px;font-weight:600}input{box-sizing:border-box;width:100%;padding:11px;margin-top:6px;border:1px solid #bbc4cc;border-radius:7px;font-size:15px}button{width:100%;margin-top:24px;padding:12px;border:0;border-radius:7px;background:#1769aa;color:white;font-size:16px}a{color:#1769aa}p{color:#5d6872;font-size:14px;line-height:1.5}</style></head><body><main><h1>ESP32-C3 环境采集器配置</h1><p>保存后设备会自动重启。WS 地址支持 ws:// 和 wss://。</p><form method='post' action='/save'>");
-    page += F("<label>WiFi 名称<input name='ssid' maxlength='63' required value='"); page += htmlEscape(config.wifiSsid); page += F("'></label>");
-    page += F("<label>WiFi 密码<input name='password' type='password' maxlength='63' value='"); page += htmlEscape(config.wifiPassword); page += F("'></label>");
-    page += F("<label>WS 地址<input name='ws' maxlength='159' required value='"); page += htmlEscape(config.wsUrl); page += F("'></label>");
-    page += F("<label>Token<input name='token' maxlength='159' required value='"); page += htmlEscape(config.token); page += F("'></label>");
+    page += F("<h2>WiFi 列表（最多 5 个，按顺序尝试）</h2>");
+    for (uint8_t i = 0; i < kMaxWifiNetworks; ++i) {
+        page += F("<fieldset><legend>WiFi "); page += i + 1; page += F("</legend><label>名称<input name='ssid"); page += i; page += F("' maxlength='63' value='"); page += htmlEscape(config.wifi[i].ssid); page += F("'></label><label>密码<input name='password"); page += i; page += F("' type='password' maxlength='63' value='"); page += htmlEscape(config.wifi[i].password); page += F("'></label></fieldset>");
+    }
+    page += F("<h2>服务器列表（最多 3 个，并行独立连接）</h2>");
+    for (uint8_t i = 0; i < kMaxServers; ++i) {
+        page += F("<fieldset><legend>服务器 "); page += i + 1; page += F("</legend><label>WS 地址<input name='ws"); page += i; page += F("' maxlength='159' value='"); page += htmlEscape(config.servers[i].wsUrl); page += F("'></label><label>Token<input name='token"); page += i; page += F("' maxlength='159' value='"); page += htmlEscape(config.servers[i].token); page += F("'></label></fieldset>");
+    }
     page += F("<label>设备 ID<input name='device' maxlength='63' required value='"); page += htmlEscape(config.deviceId); page += F("'></label><label>上传间隔（秒，10-30）<input name='interval' type='number' min='10' max='30' required value='"); page += uploadIntervalSeconds; page += F("'></label><label>新管理密码<input name='newPassword' type='password' minlength='8' maxlength='96' placeholder='留空则保持不变'></label><label>确认新管理密码<input name='confirmPassword' type='password' minlength='8' maxlength='96' placeholder='留空则保持不变'></label><button type='submit'>保存配置</button></form><p><a href='/panel'>打开运行面板</a> · <form method='post' action='/logout' style='display:inline'><button type='submit' style='width:auto;margin:0;padding:4px 10px;background:#68737d'>退出登录</button></form></p></main></body></html>");
     webServer.send(200, "text/html; charset=utf-8", page);
 }
@@ -686,7 +761,11 @@ void handlePanel() {
     page += F("<p>模式："); page += configMode ? F("配置 AP") : F("联网采集");
     page += F("<br>WiFi："); page += WiFi.status() == WL_CONNECTED ? F("已连接 ") : F("未连接 ");
     page += WiFi.localIP().toString();
-    page += F("<br>WebSocket："); page += (authenticated && websocket.isConnected()) ? F("传输已连接，认证成功") : F("未连接或未认证");
+    page += F("<br>服务器：");
+    for (uint8_t i = 0; i < serverCount(); ++i) {
+        page += String(i + 1) + (serverAuthenticated[i] && websockets[i].isConnected() ? " 已认证" : " 未连接/未认证");
+        if (i + 1 < serverCount()) page += ", ";
+    }
     page += F("<br>设备 ID："); page += htmlEscape(config.deviceId); page += F("</p><p>扫描与上传间隔："); page += uploadIntervalSeconds; page += F(" 秒</p><h2>最近日志</h2><pre>");
     for (uint8_t i = 0; i < logCount; ++i) { page += htmlEscape(String(logLines[i])); page += '\n'; }
     page += F("</pre><p><a href='/'>配置页面</a> · <form method='post' action='/logout' style='display:inline'><button type='submit' style='width:auto;margin:0;padding:4px 10px;background:#68737d'>退出登录</button></form></p></main></body></html>");
@@ -700,24 +779,50 @@ void handleSaveConfig() {
         return;
     }
     if (!requireSession()) return;
-    if (!webServer.hasArg("ssid") || !webServer.hasArg("password") ||
-        !webServer.hasArg("ws") || !webServer.hasArg("token") || !webServer.hasArg("device") || !webServer.hasArg("interval")) {
+    if (!webServer.hasArg("device") || !webServer.hasArg("interval")) {
         webServer.send(400, "text/plain; charset=utf-8", "缺少配置字段");
         return;
     }
-    String ws = webServer.arg("ws");
-    String host, path;
-    uint16_t port = 0;
-    bool secure = false;
-    if (!parseWsUrl(ws.c_str(), host, port, path, secure)) {
-        webServer.send(400, "text/plain; charset=utf-8", "WS 地址必须以 ws:// 或 wss:// 开头，并包含有效主机名");
+    DeviceConfig requested{};
+    uint8_t wifiWriteIndex = 0;
+    for (uint8_t i = 0; i < kMaxWifiNetworks; ++i) {
+        const String ssid = webServer.arg(String("ssid") + i);
+        const String password = webServer.arg(String("password") + i);
+        if (ssid.length() == 0) continue;
+        copyField(requested.wifi[wifiWriteIndex].ssid, sizeof(requested.wifi[wifiWriteIndex].ssid), ssid);
+        copyField(requested.wifi[wifiWriteIndex].password, sizeof(requested.wifi[wifiWriteIndex].password), password);
+        ++wifiWriteIndex;
+    }
+    uint8_t serverWriteIndex = 0;
+    for (uint8_t i = 0; i < kMaxServers; ++i) {
+        const String ws = webServer.arg(String("ws") + i);
+        const String token = webServer.arg(String("token") + i);
+        if (ws.length() == 0 && token.length() == 0) continue;
+        String host, path;
+        uint16_t port = 0;
+        bool secure = false;
+        if (!parseWsUrl(ws.c_str(), host, port, path, secure) || token.length() == 0 || serverWriteIndex >= kMaxServers) {
+            webServer.send(400, "text/plain; charset=utf-8", "每个服务器必须包含有效 WS 地址和 Token");
+            return;
+        }
+        copyField(requested.servers[serverWriteIndex].wsUrl, sizeof(requested.servers[serverWriteIndex].wsUrl), ws);
+        copyField(requested.servers[serverWriteIndex].token, sizeof(requested.servers[serverWriteIndex].token), token);
+        ++serverWriteIndex;
+    }
+    if (wifiWriteIndex == 0) {
+        webServer.send(400, "text/plain; charset=utf-8", "至少配置一个 WiFi");
         return;
     }
-    copyField(config.wifiSsid, sizeof(config.wifiSsid), webServer.arg("ssid"));
-    copyField(config.wifiPassword, sizeof(config.wifiPassword), webServer.arg("password"));
-    copyField(config.wsUrl, sizeof(config.wsUrl), ws);
-    copyField(config.token, sizeof(config.token), webServer.arg("token"));
-    copyField(config.deviceId, sizeof(config.deviceId), webServer.arg("device"));
+    if (serverWriteIndex == 0) {
+        webServer.send(400, "text/plain; charset=utf-8", "至少配置一个服务器");
+        return;
+    }
+    copyField(requested.deviceId, sizeof(requested.deviceId), webServer.arg("device"));
+    if (requested.deviceId[0] == '\0') {
+        webServer.send(400, "text/plain; charset=utf-8", "设备 ID 不能为空");
+        return;
+    }
+    copyField(requested.passwordHash, sizeof(requested.passwordHash), config.passwordHash);
     const long requestedInterval = webServer.arg("interval").toInt();
     if (requestedInterval < static_cast<long>(kMinimumUploadIntervalSeconds) ||
         requestedInterval > static_cast<long>(kMaximumUploadIntervalSeconds)) {
@@ -725,7 +830,7 @@ void handleSaveConfig() {
         return;
     }
     uploadIntervalSeconds = static_cast<uint32_t>(requestedInterval);
-    config.uploadIntervalSeconds = uploadIntervalSeconds;
+    requested.uploadIntervalSeconds = uploadIntervalSeconds;
     const String newPassword = webServer.arg("newPassword");
     const String confirmPassword = webServer.arg("confirmPassword");
     if (newPassword.length() > 0) {
@@ -733,8 +838,9 @@ void handleSaveConfig() {
             webServer.send(400, "text/plain; charset=utf-8", "新管理密码无效或两次输入不一致");
             return;
         }
-        copyField(config.passwordHash, sizeof(config.passwordHash), passwordDigest(newPassword));
+        copyField(requested.passwordHash, sizeof(requested.passwordHash), passwordDigest(newPassword));
     }
+    config = requested;
     saveConfig();
     sessionToken = "";
     sendSecurityHeaders();
@@ -775,10 +881,12 @@ void startConfigMode() {
     configMode = true;
     configModeStartedAt = millis();
     lastConfigActivityAt = configModeStartedAt;
-    authenticated = false;
-    webSocketStarted = false;
+    for (uint8_t i = 0; i < kMaxServers; ++i) {
+        serverAuthenticated[i] = false;
+        websockets[i].disconnect();
+        webSocketStarted[i] = false;
+    }
     setLed(true);
-    websocket.disconnect();
     WiFi.disconnect(true);
     WiFi.mode(WIFI_AP);
     const String apName = String("RemoteEnv-Setup-") + String(getChipIdHex());
@@ -793,10 +901,10 @@ void startConfigMode() {
 
 void beginWifiAttempt() {
     WiFi.mode(WIFI_STA);
-    WiFi.begin(config.wifiSsid, config.wifiPassword);
+    WiFi.begin(config.wifi[wifiIndex].ssid, config.wifi[wifiIndex].password);
     wifiAttemptStartedAt = millis();
     wifiConnecting = true;
-    addLog(String("尝试连接 WiFi：") + config.wifiSsid);
+    addLog(String("尝试连接 WiFi ") + (wifiIndex + 1) + "：" + config.wifi[wifiIndex].ssid);
 }
 
 void maintainWifi() {
@@ -809,67 +917,77 @@ void maintainWifi() {
             tzset();
             configTime(0, 0, "ntp1.aliyun.com", "pool.ntp.org", "time.nist.gov");
             if (!webServerStarted) startLocalWebServer();
-            nextWebSocketRetryAt = now;
+            for (uint8_t i = 0; i < kMaxServers; ++i) nextWebSocketRetryAt[i] = now;
+            wifiRetryDelayMs = kWifiRetryBaseIntervalMs;
+            wifiRound = 0;
         }
         return;
     }
-    authenticated = false;
-    if (webSocketStarted) {
-        websocket.disconnect();
-        webSocketStarted = false;
+    for (uint8_t i = 0; i < kMaxServers; ++i) {
+        serverAuthenticated[i] = false;
+        if (webSocketStarted[i]) {
+            websockets[i].disconnect();
+            webSocketStarted[i] = false;
+        }
     }
     if (wifiConnecting && now - wifiAttemptStartedAt < kWifiConnectTimeoutMs) return;
     if (wifiConnecting) {
         wifiConnecting = false;
-        addLog("WiFi 连接失败，5 秒后无限重试");
+        addLog(String("WiFi ") + (wifiIndex + 1) + " 连接失败");
         WiFi.disconnect();
+        ++wifiIndex;
+        if (wifiIndex >= wifiCount()) {
+            wifiIndex = 0;
+            ++wifiRound;
+            wifiRetryDelayMs = min<uint32_t>(wifiRetryDelayMs * 2, kWifiRetryMaximumIntervalMs);
+            addLog(String("WiFi 第 ") + wifiRound + " 轮失败，" + wifiRetryDelayMs / 1000 + " 秒后重新尝试");
+        }
     }
     if (static_cast<int32_t>(now - nextWifiRetryAt) >= 0) {
-        nextWifiRetryAt = now + kWifiRetryIntervalMs;
+        nextWifiRetryAt = now + (wifiIndex == 0 ? wifiRetryDelayMs : 250);
         beginWifiAttempt();
     }
 }
 
-void startWebSocket() {
-    if (webSocketStarted || WiFi.status() != WL_CONNECTED) return;
+void startWebSocket(uint8_t serverIndex) {
+    if (serverIndex >= serverCount() || webSocketStarted[serverIndex] || WiFi.status() != WL_CONNECTED) return;
     String host, path;
     uint16_t port = 0;
     bool secure = false;
-    if (!parseWsUrl(config.wsUrl, host, port, path, secure)) {
-        addLog("WS 地址无效，5 秒后继续重试");
-        nextWebSocketRetryAt = millis() + kWebSocketRetryIntervalMs;
+    if (!parseWsUrl(config.servers[serverIndex].wsUrl, host, port, path, secure)) {
+        addLog(String("服务器 ") + (serverIndex + 1) + " WS 地址无效");
+        nextWebSocketRetryAt[serverIndex] = millis() + kWebSocketRetryIntervalMs;
         return;
     }
-    if (secure) {
-        websocket.beginSSL(host.c_str(), port, path.c_str(), nullptr, "arduino");
-    } else {
-        websocket.begin(host.c_str(), port, path.c_str(), "arduino");
-    }
-    websocket.onEvent(onWebSocketEvent);
-    websocket.setReconnectInterval(kWebSocketRetryIntervalMs);
-    websocket.enableHeartbeat(15000, 3000, 2);
-    webSocketStarted = true;
-    addLog("开始 WebSocket 无限重试");
+    if (secure) websockets[serverIndex].beginSSL(host.c_str(), port, path.c_str(), nullptr, "arduino");
+    else websockets[serverIndex].begin(host.c_str(), port, path.c_str(), "arduino");
+    if (serverIndex == 0) websockets[serverIndex].onEvent(onWebSocketEvent0);
+    else if (serverIndex == 1) websockets[serverIndex].onEvent(onWebSocketEvent1);
+    else websockets[serverIndex].onEvent(onWebSocketEvent2);
+    websockets[serverIndex].setReconnectInterval(kWebSocketRetryIntervalMs);
+    websockets[serverIndex].enableHeartbeat(15000, 3000, 2);
+    webSocketStarted[serverIndex] = true;
+    addLog(String("服务器 ") + (serverIndex + 1) + " 开始 WebSocket 无限重试");
 }
 
 void maintainWebSocket() {
     const uint32_t now = millis();
-    if (websocket.isConnected() && !authenticated && connectedAt != 0 &&
-        now - connectedAt >= kAuthTimeoutMs) {
-        addLog("WebSocket 认证超时，主动断开等待重连");
-        websocket.disconnect();
-        connectedAt = 0;
-        webSocketStarted = false;
-    }
-    if (static_cast<int32_t>(now - nextWebSocketRetryAt) >= 0) {
-        nextWebSocketRetryAt = now + kWebSocketRetryIntervalMs;
-        startWebSocket();
-    }
-    if (authenticated && websocket.isConnected() &&
-        now - lastApplicationPingAt >= kApplicationPingIntervalMs) {
-        websocket.sendTXT("{\"type\":\"ping\"}");
-        lastApplicationPingAt = now;
-        addLog("发送应用层 Ping");
+    for (uint8_t i = 0; i < kMaxServers; ++i) {
+        if (i >= serverCount()) continue;
+        if (websockets[i].isConnected() && !serverAuthenticated[i] && connectedAt[i] != 0 && now - connectedAt[i] >= kAuthTimeoutMs) {
+            addLog(String("服务器 ") + (i + 1) + " 认证超时，主动断开");
+            websockets[i].disconnect();
+            connectedAt[i] = 0;
+            webSocketStarted[i] = false;
+        }
+        if (static_cast<int32_t>(now - nextWebSocketRetryAt[i]) >= 0) {
+            nextWebSocketRetryAt[i] = now + kWebSocketRetryIntervalMs;
+            startWebSocket(i);
+        }
+        if (serverAuthenticated[i] && websockets[i].isConnected() && now - lastApplicationPingAt[i] >= kApplicationPingIntervalMs) {
+            websockets[i].sendTXT("{\"type\":\"ping\"}");
+            lastApplicationPingAt[i] = now;
+        }
     }
 }
 
@@ -921,7 +1039,7 @@ void loop() {
     webServer.handleClient();
     maintainWifi();
     if (WiFi.status() == WL_CONNECTED) {
-        websocket.loop();
+        for (uint8_t i = 0; i < kMaxServers; ++i) websockets[i].loop();
         maintainWebSocket();
         const uint32_t now = millis();
         if (static_cast<int32_t>(now - nextUploadAt) >= 0) {
