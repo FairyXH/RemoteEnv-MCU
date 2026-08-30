@@ -2,6 +2,7 @@
 #include <ArduinoJson.h>
 #include <mbedtls/sha256.h>
 #include <EEPROM.h>
+#include <Preferences.h>
 #include <WebServer.h>
 #include <NimBLEDevice.h>
 #include <WiFi.h>
@@ -93,7 +94,10 @@ bool wifiSnapshotReady = false;
 bool bluetoothSnapshotReady = false;
 SemaphoreHandle_t snapshotMutex = nullptr;
 TaskHandle_t scanTaskHandle = nullptr;
-volatile bool scanTaskEnabled = false;
+bool scanTaskEnabled = false;
+Preferences sequencePreferences;
+uint64_t bluetoothSequence = 0;
+uint64_t wifiSequence = 0;
 
 void addLog(const String& message) {
     Serial.println(message);
@@ -236,6 +240,22 @@ void loadConfig() {
     uploadIntervalSeconds = config.uploadIntervalSeconds;
 }
 
+void loadSequences() {
+    if (!sequencePreferences.begin("sequences", false)) {
+        addLog("序列号存储初始化失败，将使用当前时间兜底");
+        return;
+    }
+    bluetoothSequence = sequencePreferences.getULong64("bluetooth", 0);
+    wifiSequence = sequencePreferences.getULong64("wifi", 0);
+}
+
+uint64_t nextSequence(uint64_t& lastSequence, const char* key, uint64_t now) {
+    const uint64_t candidate = lastSequence == UINT64_MAX ? UINT64_MAX : lastSequence + 1;
+    lastSequence = now > candidate ? now : candidate;
+    sequencePreferences.putULong64(key, lastSequence);
+    return lastSequence;
+}
+
 void saveConfig() {
     StoredConfig stored{ kConfigMagic, config };
     EEPROM.put(0, stored);
@@ -342,6 +362,7 @@ void blinkConnected();
 String base64Encode(const uint8_t* data, size_t length);
 
 void scanBluetoothSnapshot(uint32_t durationMs) {
+    const uint64_t scanStartedAt = currentEpochMillis();
     NimBLEScan* scanner = NimBLEDevice::getScan();
     scanner->setActiveScan(true);
     scanner->setInterval(100);
@@ -361,54 +382,43 @@ void scanBluetoothSnapshot(uint32_t durationMs) {
         item["name"] = device->haveName() ? device->getName().c_str() : "";
         item["address"] = device->getAddress().toString().c_str();
         item["rssi"] = device->getRSSI();
-        item["mode"] = "ble";
-        item["addressType"] = device->getAddressType();
-        item["advType"] = device->getAdvType();
-        item["advFlags"] = device->getAdvFlags();
-        item["advLength"] = device->getAdvLength();
-        item["connectable"] = device->isConnectable();
-        item["scannable"] = device->isScannable();
-        if (device->haveAppearance()) item["appearance"] = device->getAppearance();
-        if (device->haveURI()) item["uri"] = device->getURI().c_str();
-        if (device->haveTXPower()) item["txPower"] = device->getTXPower();
+        item["address_type"] = "unknown";
+
+        if (device->haveTXPower()) item["tx_power"] = device->getTXPower();
         if (device->haveServiceUUID()) {
-            JsonArray uuids = item["serviceUuids"].to<JsonArray>();
+            JsonArray uuids = item["service_uuids"].to<JsonArray>();
             for (int j = 0; j < device->getServiceUUIDCount(); ++j) {
                 uuids.add(device->getServiceUUID(j).toString().c_str());
             }
-            if (device->getServiceUUIDCount() > 0) {
-                item["uuid"] = device->getServiceUUID(0).toString().c_str();
-            }
+
         }
         if (device->haveServiceData()) {
-            JsonObject serviceData = item["serviceData"].to<JsonObject>();
+            JsonObject serviceData = item["service_data"].to<JsonObject>();
             for (uint8_t j = 0; j < device->getServiceDataCount(); ++j) {
                 const std::string raw = device->getServiceData(j);
-                String hex;
-                for (uint8_t byte : raw) {
-                    if (byte < 16) hex += '0';
-                    hex += String(byte, HEX);
-                }
-                serviceData[device->getServiceDataUUID(j).toString().c_str()] = hex;
+                serviceData[device->getServiceDataUUID(j).toString().c_str()] =
+                    base64Encode(reinterpret_cast<const uint8_t*>(raw.data()), raw.length());
             }
         }
         if (device->haveManufacturerData()) {
-            JsonObject manufacturers = item["manufacturerData"].to<JsonObject>();
-            for (uint8_t j = 0; j < device->getManufacturerDataCount(); ++j) {
-                const std::string raw = device->getManufacturerData(j);
-                const String hex = bytesToHex(reinterpret_cast<const uint8_t*>(raw.data()), raw.length());
-                const String companyId = raw.length() >= 2
-                    ? String(static_cast<uint16_t>(static_cast<uint8_t>(raw[0])) |
-                             (static_cast<uint16_t>(static_cast<uint8_t>(raw[1])) << 8))
-                    : String(j);
-                manufacturers[companyId] = hex;
+            const std::string raw = device->getManufacturerData(0);
+            if (raw.length() >= 2) {
+                item["manufacturer_id"] = static_cast<uint16_t>(static_cast<uint8_t>(raw[0])) |
+                    (static_cast<uint16_t>(static_cast<uint8_t>(raw[1])) << 8);
             }
+            item["manufacturer_data"] = base64Encode(
+                reinterpret_cast<const uint8_t*>(raw.data()), raw.length());
         }
         const std::vector<uint8_t>& rawAdvertisement = device->getPayload();
         item["rawHex"] = bytesToHex(rawAdvertisement.data(), rawAdvertisement.size());
         item["rawLength"] = rawAdvertisement.size();
         item["raw"] = base64Encode(rawAdvertisement.data(), rawAdvertisement.size());
+        item["timestamp"] = currentEpochMillis();
     }
+    document["scan_started_at"] = scanStartedAt;
+    document["scan_finished_at"] = currentEpochMillis();
+    document["technology"] = "ble";
+    document["is_enabled"] = true;
     String encoded;
     serializeJson(document, encoded);
     if (encoded.length() < sizeof(bluetoothSnapshot)) {
@@ -421,6 +431,7 @@ void scanBluetoothSnapshot(uint32_t durationMs) {
 }
 
 void scanWifiSnapshot(uint32_t durationMs) {
+    const uint64_t scanStartedAt = currentEpochMillis();
     const uint32_t perChannelMs = max<uint32_t>(100, durationMs / 14);
     const int count = WiFi.scanNetworks(false, true, false, perChannelMs);
     addLog(String("WiFi 扫描完成：") + count + " 个");
@@ -433,9 +444,21 @@ void scanWifiSnapshot(uint32_t durationMs) {
         network["bssid"] = WiFi.BSSIDstr(i);
         network["rssi"] = WiFi.RSSI(i);
         network["channel"] = WiFi.channel(i);
-        network["encryption"] = static_cast<int>(WiFi.encryptionType(i));
-        network["frequency"] = WiFi.channel(i) <= 14 ? 2407 + WiFi.channel(i) * 5 : 5000 + WiFi.channel(i) * 5;
-        network["capabilities"] = static_cast<int>(WiFi.encryptionType(i));
+        network["frequency_mhz"] = WiFi.channel(i) <= 14 ? 2407 + WiFi.channel(i) * 5 : 5000 + WiFi.channel(i) * 5;
+        JsonArray security = network["security"].to<JsonArray>();
+        security.add(WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "OPEN" : "WPA2-PSK");
+        network["hidden"] = WiFi.SSID(i).length() == 0;
+        network["timestamp"] = currentEpochMillis();
+    }
+    document["scan_started_at"] = scanStartedAt;
+    document["scan_finished_at"] = currentEpochMillis();
+    document["interface"] = "wlan0";
+    document["is_connected"] = WiFi.status() == WL_CONNECTED;
+    if (WiFi.status() == WL_CONNECTED) {
+        document["ip_address"] = WiFi.localIP().toString();
+        document["gateway"] = WiFi.gatewayIP().toString();
+        JsonArray dnsServers = document["dns_servers"].to<JsonArray>();
+        dnsServers.add(WiFi.dnsIP().toString());
     }
     String encoded;
     serializeJson(document, encoded);
@@ -492,12 +515,10 @@ void sendCombinedSnapshot() {
     const bool bluetoothReady = bluetoothSnapshotReady;
     if (!wifiReady) wifiCopy = "{\"networks\":[]}";
     if (!bluetoothReady) bluetoothCopy = "{\"devices\":[]}";
-    static uint64_t bluetoothSequence = 0;
-    static uint64_t wifiSequence = 0;
-    bluetoothSequence = timestamp > bluetoothSequence ? timestamp : bluetoothSequence + 1;
-    wifiSequence = timestamp > wifiSequence ? timestamp : wifiSequence + 1;
-    sendEnvironmentData(kBluetoothDataType, bluetoothCopy.c_str(), bluetoothSequence, timestamp);
-    sendEnvironmentData(kWifiDataType, wifiCopy.c_str(), wifiSequence, timestamp);
+    const uint64_t nextBluetoothSequence = nextSequence(bluetoothSequence, "bluetooth", timestamp);
+    const uint64_t nextWifiSequence = nextSequence(wifiSequence, "wifi", timestamp);
+    sendEnvironmentData(kBluetoothDataType, bluetoothCopy.c_str(), nextBluetoothSequence, timestamp);
+    sendEnvironmentData(kWifiDataType, wifiCopy.c_str(), nextWifiSequence, timestamp);
 }
 
 
@@ -875,6 +896,7 @@ void setup() {
     Serial.printf("LED GPIO=%u, GPIO0=%s\n", kLedPin, digitalRead(kConfigButtonPin) == LOW ? "LOW" : "HIGH");
     NimBLEDevice::init("");
     loadConfig();
+    loadSequences();
 
     if (!hasConfig() || digitalRead(kConfigButtonPin) == LOW) {
         startConfigMode();
