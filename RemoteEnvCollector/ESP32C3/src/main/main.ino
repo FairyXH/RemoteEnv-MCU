@@ -142,7 +142,8 @@ uint64_t bluetoothSnapshotAt = 0;
 bool wifiSnapshotReady = false;
 bool bluetoothSnapshotReady = false;
 volatile uint32_t scanGeneration = 0;
-uint32_t uploadedScanGeneration = 0;
+uint32_t uploadedScanGeneration[kMaxServers]{};
+uint32_t lastNoServerLogAt = 0;
 SemaphoreHandle_t snapshotMutex = nullptr;
 TaskHandle_t scanTaskHandle = nullptr;
 bool scanTaskEnabled = false;
@@ -618,17 +619,27 @@ void sendEnvironmentData(uint8_t serverIndex, const char* dataType, const char* 
 }
 
 void sendCombinedSnapshot() {
+    const uint32_t generation = scanGeneration;
+    bool pending = false;
+    for (uint8_t i = 0; i < serverCount(); ++i) {
+        if (uploadedScanGeneration[i] != generation) {
+            pending = true;
+            break;
+        }
+    }
+    if (!pending) return;
     bool anyServerReady = false;
-    for (uint8_t i = 0; i < kMaxServers; ++i) anyServerReady |= serverAuthenticated[i] && websockets[i].isConnected();
+    for (uint8_t i = 0; i < serverCount(); ++i) anyServerReady |= serverAuthenticated[i] && websockets[i].isConnected();
     if (!anyServerReady) {
-        addLog("组合上传跳过：没有已认证服务器");
+        const uint32_t now = millis();
+        if (now - lastNoServerLogAt >= 5000) {
+            lastNoServerLogAt = now;
+            addLog("组合上传等待服务器认证，5 秒后重试");
+        }
         return;
     }
     const uint64_t timestamp = currentEpochMillis();
     if (timestamp == 0) return;
-    const uint32_t generation = scanGeneration;
-    if (generation == uploadedScanGeneration) return;
-    uploadedScanGeneration = generation;
     String wifiCopy;
     String bluetoothCopy;
     bool wifiReady;
@@ -647,6 +658,7 @@ void sendCombinedSnapshot() {
         const uint64_t nextWifiSequence = nextSequence(wifiSequence[i], (String("wifi") + i).c_str(), timestamp);
         sendEnvironmentData(i, kBluetoothDataType, bluetoothCopy.c_str(), nextBluetoothSequence, timestamp);
         sendEnvironmentData(i, kWifiDataType, wifiCopy.c_str(), nextWifiSequence, timestamp);
+        uploadedScanGeneration[i] = generation;
     }
 }
 
@@ -998,12 +1010,15 @@ void maintainWifi() {
         if (wifiIndex >= wifiCount()) {
             wifiIndex = 0;
             ++wifiRound;
-            wifiRetryDelayMs = min<uint32_t>(wifiRetryDelayMs * 2, kWifiRetryMaximumIntervalMs);
             addLog(String("WiFi 第 ") + wifiRound + " 轮失败，" + wifiRetryDelayMs / 1000 + " 秒后重新尝试");
+            nextWifiRetryAt = now + wifiRetryDelayMs;
+            wifiRetryDelayMs = min<uint32_t>(wifiRetryDelayMs * 2, kWifiRetryMaximumIntervalMs);
+        } else {
+            nextWifiRetryAt = now + 250;
         }
     }
     if (static_cast<int32_t>(now - nextWifiRetryAt) >= 0) {
-        nextWifiRetryAt = now + (wifiIndex == 0 ? wifiRetryDelayMs : 250);
+        nextWifiRetryAt = UINT32_MAX;
         beginWifiAttempt();
     }
 }
