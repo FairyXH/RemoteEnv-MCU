@@ -141,6 +141,8 @@ uint64_t wifiSnapshotAt = 0;
 uint64_t bluetoothSnapshotAt = 0;
 bool wifiSnapshotReady = false;
 bool bluetoothSnapshotReady = false;
+volatile uint32_t scanGeneration = 0;
+uint32_t uploadedScanGeneration = 0;
 SemaphoreHandle_t snapshotMutex = nullptr;
 TaskHandle_t scanTaskHandle = nullptr;
 bool scanTaskEnabled = false;
@@ -264,7 +266,7 @@ uint8_t serverCount() {
 }
 
 bool hasConfig() {
-    return wifiCount() > 0 && serverCount() > 0 && config.deviceId[0] != '\0';
+    return wifiCount() > 0 && serverCount() > 0 && config.servers[0].deviceId[0] != '\0';
 }
 
 void copyField(char* destination, size_t capacity, const String& value) {
@@ -514,10 +516,12 @@ void scanBluetoothSnapshot(uint32_t durationMs) {
     String encoded;
     serializeJson(document, encoded);
     if (encoded.length() < sizeof(bluetoothSnapshot)) {
+        if (snapshotMutex != nullptr) xSemaphoreTake(snapshotMutex, portMAX_DELAY);
         encoded.toCharArray(bluetoothSnapshot, sizeof(bluetoothSnapshot));
         bluetoothSnapshotLength = encoded.length();
         bluetoothSnapshotAt = currentEpochMillis();
         bluetoothSnapshotReady = true;
+        if (snapshotMutex != nullptr) xSemaphoreGive(snapshotMutex);
     }
     scanner->clearResults();
 }
@@ -555,10 +559,12 @@ void scanWifiSnapshot(uint32_t durationMs) {
     String encoded;
     serializeJson(document, encoded);
     if (encoded.length() < sizeof(wifiSnapshot)) {
+        if (snapshotMutex != nullptr) xSemaphoreTake(snapshotMutex, portMAX_DELAY);
         encoded.toCharArray(wifiSnapshot, sizeof(wifiSnapshot));
         wifiSnapshotLength = encoded.length();
         wifiSnapshotAt = currentEpochMillis();
         wifiSnapshotReady = true;
+        if (snapshotMutex != nullptr) xSemaphoreGive(snapshotMutex);
     }
     WiFi.scanDelete();
 }
@@ -570,6 +576,14 @@ void runScanCycle() {
     addLog(String("开始扫描周期：Bluetooth ") + bluetoothMs / 1000 + " 秒，WiFi " + wifiMs / 1000 + " 秒");
     scanBluetoothSnapshot(bluetoothMs);
     scanWifiSnapshot(wifiMs);
+    ++scanGeneration;
+}
+
+void scanWorker(void*) {
+    for (;;) {
+        if (!configMode && WiFi.status() == WL_CONNECTED) runScanCycle();
+        vTaskDelay(pdMS_TO_TICKS(uploadIntervalSeconds * 1000UL));
+    }
 }
 
 void startWebSocket(uint8_t serverIndex);
@@ -612,10 +626,19 @@ void sendCombinedSnapshot() {
     }
     const uint64_t timestamp = currentEpochMillis();
     if (timestamp == 0) return;
-    String wifiCopy(wifiSnapshot);
-    String bluetoothCopy(bluetoothSnapshot);
-    const bool wifiReady = wifiSnapshotReady;
-    const bool bluetoothReady = bluetoothSnapshotReady;
+    const uint32_t generation = scanGeneration;
+    if (generation == uploadedScanGeneration) return;
+    uploadedScanGeneration = generation;
+    String wifiCopy;
+    String bluetoothCopy;
+    bool wifiReady;
+    bool bluetoothReady;
+    if (snapshotMutex != nullptr) xSemaphoreTake(snapshotMutex, portMAX_DELAY);
+    wifiCopy = wifiSnapshot;
+    bluetoothCopy = bluetoothSnapshot;
+    wifiReady = wifiSnapshotReady;
+    bluetoothReady = bluetoothSnapshotReady;
+    if (snapshotMutex != nullptr) xSemaphoreGive(snapshotMutex);
     if (!wifiReady) wifiCopy = "{\"networks\":[]}";
     if (!bluetoothReady) bluetoothCopy = "{\"devices\":[]}";
     for (uint8_t i = 0; i < serverCount(); ++i) {
@@ -858,11 +881,6 @@ void handleSaveConfig() {
         webServer.send(400, "text/plain; charset=utf-8", "至少配置一个服务器");
         return;
     }
-    copyField(requested.deviceId, sizeof(requested.deviceId), webServer.arg("device"));
-    if (requested.deviceId[0] == '\0') {
-        webServer.send(400, "text/plain; charset=utf-8", "设备 ID 不能为空");
-        return;
-    }
     copyField(requested.passwordHash, sizeof(requested.passwordHash), config.passwordHash);
     const long requestedInterval = webServer.arg("interval").toInt();
     if (requestedInterval < static_cast<long>(kMinimumUploadIntervalSeconds) ||
@@ -1056,6 +1074,8 @@ void setup() {
     NimBLEDevice::init("");
     loadConfig();
     loadSequences();
+    snapshotMutex = xSemaphoreCreateMutex();
+    if (snapshotMutex != nullptr) xTaskCreate(scanWorker, "env-scan", 8192, nullptr, 1, &scanTaskHandle);
 
     if (!hasConfig() || digitalRead(kConfigButtonPin) == LOW) {
         startConfigMode();
@@ -1082,12 +1102,7 @@ void loop() {
     if (WiFi.status() == WL_CONNECTED) {
         for (uint8_t i = 0; i < kMaxServers; ++i) websockets[i].loop();
         maintainWebSocket();
-        const uint32_t now = millis();
-        if (static_cast<int32_t>(now - nextUploadAt) >= 0) {
-            nextUploadAt = now + uploadIntervalSeconds * 1000UL;
-            runScanCycle();
-            sendCombinedSnapshot();
-        }
+        sendCombinedSnapshot();
     }
-    delay(10);
+    delay(2);
 }
