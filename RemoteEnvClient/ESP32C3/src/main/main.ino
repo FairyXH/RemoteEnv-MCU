@@ -31,6 +31,8 @@ constexpr uint32_t kWsRetryMaxMs = 60000;
 constexpr uint32_t kAuthTimeoutMs = 20000;
 constexpr uint32_t kPingIntervalMs = 20000;
 constexpr uint32_t kPullIntervalMs = 5000;
+constexpr uint32_t kMinPullIntervalSec = 1;
+constexpr uint32_t kMaxPullIntervalSec = 3600;
 constexpr uint32_t kPollDeadlineMs = 30000;
 constexpr uint8_t kMaxSelectedWifi = 16;
 constexpr uint8_t kLogCapacity = 24;
@@ -54,6 +56,7 @@ struct Config {
     Wifi wifi[kMaxWifi];
     ServerProfile server;
     char passwordHash[65];
+    uint32_t pullIntervalSec;
 };
 
 Config config{};
@@ -98,6 +101,8 @@ bool remoteDevicesDirty = true;
 uint32_t lastDeviceListUpdate = 0;
 bool pullInFlight = false;
 uint32_t nextPollDeadline = 0;
+enum class LedMode : uint8_t { Config, Disconnected, Normal };
+volatile LedMode ledMode = LedMode::Disconnected;
 
 void logLine(const String &text) {
     Serial.println(text);
@@ -237,6 +242,7 @@ void loadConfig() {
     String json = configStore.getString("json", "");
     configStore.end();
     memset(&config, 0, sizeof(config));
+    config.pullIntervalSec = kPullIntervalMs / 1000;
     if (json.length()) {
         DynamicJsonDocument doc(4096);
         if (deserializeJson(doc, json) == DeserializationError::Ok) {
@@ -248,6 +254,7 @@ void loadConfig() {
             copyText(config.server.ws, sizeof(config.server.ws), doc["server"]["ws"] | "");
             copyText(config.server.token, sizeof(config.server.token), doc["server"]["token"] | "");
             copyText(config.server.http, sizeof(config.server.http), doc["server"]["http"] | "");
+            config.pullIntervalSec = doc["pull_interval_sec"] | (kPullIntervalMs / 1000);
         }
     }
     configStore.begin(kPrefsSelected, true);
@@ -256,6 +263,9 @@ void loadConfig() {
     selected.toCharArray(runtimeSelectedDeviceId, sizeof(runtimeSelectedDeviceId));
     runtimeSelectedDeviceId[sizeof(runtimeSelectedDeviceId) - 1] = 0;
     if (config.server.ws[0]) deriveHttpFromWs();
+    if (config.pullIntervalSec < kMinPullIntervalSec || config.pullIntervalSec > kMaxPullIntervalSec) {
+        config.pullIntervalSec = kPullIntervalMs / 1000;
+    }
 }
 
 void saveConfig() {
@@ -271,6 +281,7 @@ void saveConfig() {
     server["ws"] = config.server.ws;
     server["token"] = config.server.token;
     server["http"] = config.server.http;
+    doc["pull_interval_sec"] = config.pullIntervalSec;
     String json;
     serializeJson(doc, json);
     configStore.begin(kPrefsConfig, false);
@@ -657,12 +668,13 @@ void pollDeviceList() {
 void pullTick() {
     const uint32_t now = millis();
     if (!hasConfig() || WiFi.status() != WL_CONNECTED) return;
-    if (now - lastSelectedPullAt >= kPullIntervalMs) {
+    const uint32_t pullIntervalMs = config.pullIntervalSec * 1000UL;
+    if (now - lastSelectedPullAt >= pullIntervalMs) {
+        // Each refresh replaces the complete simulation snapshot.
+        beacon.stop();
+        ble.stop();
         pollLatestSelected();
         lastSelectedPullAt = now;
-    }
-    if (now - lastDeviceListUpdate >= kPullIntervalMs * 2) {
-        pollDeviceList();
     }
     // If the selected device went silent, fall back to polling /api/latest-data
     // instead of relying on push frames. This keeps Beacon and BLE in sync
@@ -725,45 +737,43 @@ void onWsEvent(WStype_t event, uint8_t *payload, size_t length) {
     }
 }
 
-void ledMaintain() {
-    enum class LedState : uint8_t { Config, Disconnected, Normal };
-    static LedState previousState = LedState::Config;
-    static uint32_t changedAt = 0;
-    static bool ledOn = true;
-    const uint32_t now = millis();
-    const LedState state = configMode
-                               ? LedState::Config
-                               : (WiFi.status() != WL_CONNECTED || !ws.isConnected() || !authenticated)
-                                     ? LedState::Disconnected
-                                     : LedState::Normal;
-
-    if (state != previousState) {
-        previousState = state;
-        changedAt = now;
-        ledOn = state != LedState::Normal;
-        digitalWrite(kLedPin, ledOn ? LOW : HIGH);
-    }
-
-    if (state == LedState::Config) {
-        digitalWrite(kLedPin, LOW);
-        return;
-    }
-
-    if (state == LedState::Disconnected) {
-        if (now - changedAt >= 200) {
+void ledTask(void *) {
+    LedMode previous = LedMode::Disconnected;
+    bool ledOn = true;
+    uint32_t changedAt = millis();
+    for (;;) {
+        const uint32_t now = millis();
+        const LedMode mode = ledMode;
+        if (mode != previous) {
+            previous = mode;
+            changedAt = now;
+            ledOn = mode != LedMode::Normal;
+            digitalWrite(kLedPin, ledOn ? LOW : HIGH);
+        }
+        if (mode == LedMode::Config) {
+            ledOn = true;
+            digitalWrite(kLedPin, LOW);
+        } else if (mode == LedMode::Disconnected) {
+            if (now - changedAt >= 200) {
+                changedAt = now;
+                ledOn = !ledOn;
+                digitalWrite(kLedPin, ledOn ? LOW : HIGH);
+            }
+        } else if (now - changedAt >= (ledOn ? 100UL : 3000UL)) {
             changedAt = now;
             ledOn = !ledOn;
             digitalWrite(kLedPin, ledOn ? LOW : HIGH);
         }
-        return;
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
+}
 
-    const uint32_t interval = ledOn ? 100 : 3000;
-    if (now - changedAt >= interval) {
-        changedAt = now;
-        ledOn = !ledOn;
-        digitalWrite(kLedPin, ledOn ? LOW : HIGH);
-    }
+void ledMaintain() {
+    ledMode = configMode
+                               ? LedMode::Config
+                               : (WiFi.status() != WL_CONNECTED || !ws.isConnected() || !authenticated)
+                                     ? LedMode::Disconnected
+                                     : LedMode::Normal;
 }
 
 void startConfigMode();
@@ -810,9 +820,17 @@ void configPage() {
     if (!requireLogin()) return;
     String page;
     page.reserve(15000);
-    page += F("<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>RemoteEnv 客户端配置</title><style>:root{color-scheme:light}*{box-sizing:border-box}body{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:linear-gradient(135deg,#eaf2f8,#f7f9fb);margin:0;padding:24px;color:#17202a}main{max-width:860px;margin:auto}.hero,.card{background:rgba(255,255,255,.92);border:1px solid #dbe5ec;border-radius:18px;box-shadow:0 10px 30px #1c34420f}.hero{padding:28px;margin-bottom:18px}.hero h1{margin:0 0 8px;font-size:28px}.hero p{margin:0;color:#607080}.card{padding:22px;margin-bottom:18px}.card h2{margin:0 0 6px;font-size:20px}.card>p{margin:0 0 16px;color:#607080}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px}fieldset{border:1px solid #d8e2e9;border-radius:12px;padding:14px;margin:0}legend{padding:0 6px;font-weight:700;color:#1769aa}label{display:block;margin-top:10px;font-weight:600;color:#334454}input{width:100%;padding:11px;margin-top:5px;border:1px solid #b9c7d1;border-radius:9px;font-size:15px;background:#fff}input:focus{outline:2px solid #b6d9f3;border-color:#1769aa}button{padding:12px 18px;border:0;border-radius:9px;background:#1769aa;color:white;font-size:15px;cursor:pointer}.secondary{background:#64727d}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:20px}a{color:#1769aa;text-decoration:none}.notice{background:#fff7df;border:1px solid #f1d58b;color:#765500;border-radius:10px;padding:13px;margin-top:14px}.muted{font-size:13px;color:#71808d}</style></head><body><main><section class='hero'><h1>RemoteEnv 客户端配置</h1><p>ESP32-C3 环境模拟客户端 · Consumer 模式 · 5 秒间隔拉取并模拟</p><div class='notice'>配网模式在连续 5 分钟没有任何网页操作后会自动重启并退出配置模式。客户端不会绑定 device_id，只保存当前模拟设备用于下次上电恢复。</div></section><form method='post' action='/save'><section class='card'><h2>WiFi 网络列表</h2><p>按照从上到下的顺序尝试连接，空白项会自动跳过。</p><div class='grid'>");
+    page += F("<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>RemoteEnv 客户端配置</title><style>:root{color-scheme:light}*{box-sizing:border-box}body{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:linear-gradient(135deg,#eaf2f8,#f7f9fb);margin:0;padding:24px;color:#17202a}main{max-width:860px;margin:auto}.hero,.card{background:rgba(255,255,255,.92);border:1px solid #dbe5ec;border-radius:18px;box-shadow:0 10px 30px #1c34420f}.hero{padding:28px;margin-bottom:18px}.hero h1{margin:0 0 8px;font-size:28px}.hero p{margin:0;color:#607080}.card{padding:22px;margin-bottom:18px}.card h2{margin:0 0 6px;font-size:20px}.card>p{margin:0 0 16px;color:#607080}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px}fieldset{border:1px solid #d8e2e9;border-radius:12px;padding:14px;margin:0}legend{padding:0 6px;font-weight:700;color:#1769aa}label{display:block;margin-top:10px;font-weight:600;color:#334454}input{width:100%;padding:11px;margin-top:5px;border:1px solid #b9c7d1;border-radius:9px;font-size:15px;background:#fff}input:focus{outline:2px solid #b6d9f3;border-color:#1769aa}button{padding:12px 18px;border:0;border-radius:9px;background:#1769aa;color:white;font-size:15px;cursor:pointer}.secondary{background:#64727d}.actions,.wifi-tabs,.pagination{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px}.wifi-tab{border-radius:999px;padding:8px 15px;background:#dfe7ed;color:#334454}.wifi-tab.active{background:#1769aa;color:#fff}.wifi-editor{display:none;margin-top:14px}.wifi-editor.active{display:block}.device-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin-top:14px}.device{display:block;border:1px solid #d8e2e9;border-radius:13px;padding:14px;background:#fff;cursor:pointer}.device.selected{border:2px solid #1769aa;background:#eef6fc}.device input{width:auto;margin:0 8px 0 0}.device-name{font-weight:700}.device-meta{display:block;margin:6px 0;color:#607080;font-size:12px;overflow-wrap:anywhere}.pill{display:inline-block;padding:3px 9px;border-radius:999px;font-size:12px;background:#e1e5ea}.online{background:#d3f3df;color:#086c2a}.tag{font-size:12px;background:#eef6fc;color:#1769aa;border-radius:6px;padding:2px 7px}.actions{margin-top:20px}a{color:#1769aa;text-decoration:none}.notice{background:#fff7df;border:1px solid #f1d58b;color:#765500;border-radius:10px;padding:13px;margin-top:14px}.muted{font-size:13px;color:#71808d}</style></head><body><main><section class='hero'><h1>RemoteEnv 客户端配置</h1><p>ESP32-C3 环境模拟客户端 · Consumer 模式 · 自定义周期拉取并模拟</p><div class='notice'>配网模式在连续 5 分钟没有任何网页操作后会自动重启并退出配置模式。客户端只保存当前选中的模拟设备。</div></section><form method='post' action='/save'><section class='card'><h2>WiFi 网络列表</h2><p>点击胶囊配置对应网络；设备按照 WiFi 1-5 的顺序尝试连接。</p><div class='wifi-tabs'>");
     for (uint8_t i = 0; i < kMaxWifi; ++i) {
-        page += F("<fieldset><legend>网络 ");
+        page += F("<button type='button' class='wifi-tab");
+        if (i == 0) page += F(" active");
+        page += F("' onclick='showWifi("); page += i; page += F(")'>WiFi "); page += i + 1; page += F("</button>");
+    }
+    page += F("</div>");
+    for (uint8_t i = 0; i < kMaxWifi; ++i) {
+        page += F("<fieldset class='wifi-editor");
+        if (i == 0) page += F(" active");
+        page += F("'><legend>WiFi ");
         page += i + 1;
         page += F("</legend><label>SSID<input name='ssid");
         page += i;
@@ -824,11 +842,43 @@ void configPage() {
         page += escapeHtml(config.wifi[i].password).c_str();
         page += F("'></label></fieldset>");
     }
-    page += F("</div></section><section class='card'><h2>服务器连接</h2><p>单服务器长期连接，客户端通过 Consumer 角色订阅远程采集器数据。</p><label>WebSocket 地址<input name='ws' maxlength='159' required value='");
+    page += F("</section><section class='card'><h2>服务器连接</h2><p>单服务器长期连接，客户端通过 Consumer 角色订阅远程采集器数据。</p><label>WebSocket 地址<input name='ws' maxlength='159' required value='");
     page += escapeHtml(config.server.ws).c_str();
     page += F("' placeholder='wss://example.invalid/ws'></label><label>Consumer Token<input name='token' maxlength='159' required value='");
     page += escapeHtml(config.server.token).c_str();
-    page += F("'></label><p class='muted'>客户端不需要 device_id，服务器将按 Token 自动绑定 client ID。</p></section><section class='card'><h2>安全设置</h2><p>管理员密码不会以明文显示或上传。</p><div class='grid'><label>新管理员密码（可选）<input name='newPassword' type='password' minlength='8' maxlength='96' placeholder='留空表示不修改'></label><label>确认新管理员密码<input name='confirmPassword' type='password' minlength='8' maxlength='96' placeholder='再次输入新密码'></label></div><div class='actions'><button type='submit'>保存配置并重启</button><a href='/devices'><button type='button' class='secondary'>数据源管理</button></a><a href='/panel'><button type='button' class='secondary'>运行面板</button></a><button type='submit' formaction='/logout' class='secondary'>退出登录</button></div></section></form></main></body></html>");
+    page += F("'></label><label>拉取间隔（秒）<input name='pullInterval' type='number' min='1' max='3600' required value='");
+    page += config.pullIntervalSec;
+    page += F("'></label><p class='muted'>每轮先停止旧广播，拉取最新数据，再从第 1 条开始以 25ms 间隔循环发送 WiFi Beacon 和蓝牙广播。</p><div class='actions'><button type='submit' formaction='/refresh-devices'>立即加载数据源</button></div>");
+    page += F("<h3>数据源设备</h3>");
+    uint8_t total = deviceList.count();
+    int requestedPage = web.hasArg("p") ? web.arg("p").toInt() : 0;
+    const uint8_t perPage = 5;
+    uint8_t pages = total ? (total + perPage - 1) / perPage : 1;
+    uint8_t currentPage = constrain(requestedPage, 0, pages - 1);
+    if (!total) page += F("<p class='muted'>点击“立即加载数据源”获取服务端设备列表。</p>");
+    else {
+        page += F("<div class='device-grid'>");
+        uint8_t end = min<uint8_t>((currentPage + 1) * perPage, total);
+        for (uint8_t i = currentPage * perPage; i < end; ++i) {
+            const RemoteDevice *d = deviceList.at(i);
+            bool selected = hasSelectedDevice() && strcmp(runtimeSelectedDeviceId, d->deviceId) == 0;
+            page += F("<label class='device"); if (selected) page += F(" selected");
+            page += F("'><input type='radio' name='sourceDevice' value='");
+            page += escapeHtml(d->deviceId); page += F("'"); if (selected) page += F(" checked");
+            page += F(" onchange='selectSource(this.value)'><span class='device-name'>");
+            page += escapeHtml(d->name); page += F("</span><span class='device-meta'>");
+            page += escapeHtml(d->deviceId); page += F("</span><span class='pill ");
+            if (d->online) page += F("online"); page += F("'>"); page += d->online ? F("在线") : F("离线");
+            page += F("</span> <span class='tag'>WiFi "); page += d->wifiCount;
+            page += F("</span> <span class='tag'>BLE "); page += d->bleCount; page += F("</span></label>");
+        }
+        page += F("</div><div class='pagination'>");
+        if (currentPage > 0) { page += F("<a href='/?p="); page += currentPage - 1; page += F("'>上一页</a>"); }
+        page += F("<span class='muted'>第 "); page += currentPage + 1; page += F(" / "); page += pages; page += F(" 页</span>");
+        if (currentPage + 1 < pages) { page += F("<a href='/?p="); page += currentPage + 1; page += F("'>下一页</a>"); }
+        page += F("</div>");
+    }
+    page += F("</section><section class='card'><h2>安全设置</h2><p>管理员密码不会以明文显示或上传。</p><div class='grid'><label>新管理员密码（可选）<input name='newPassword' type='password' minlength='8' maxlength='96' placeholder='留空表示不修改'></label><label>确认新管理员密码<input name='confirmPassword' type='password' minlength='8' maxlength='96' placeholder='再次输入新密码'></label></div><div class='actions'><button type='submit'>保存配置并重启</button><a href='/panel'><button type='button' class='secondary'>运行面板</button></a><button type='submit' formaction='/logout' class='secondary'>退出登录</button></div></section></form><script>function showWifi(n){document.querySelectorAll('.wifi-tab,.wifi-editor').forEach((e,i)=>e.classList.toggle('active',i%5===n))}function selectSource(v){fetch('/select',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'device='+encodeURIComponent(v)}).then(()=>location.reload())}</script></main></body></html>");
     headers();
     web.send(200, "text/html; charset=utf-8", page);
 }
@@ -956,7 +1006,7 @@ void panelPage() {
         page += escapeHtml(logs[i]).c_str();
         page += '\n';
     }
-    page += F("</pre><p><a href='/'>返回配置面板</a> · <a href='/devices'>数据源管理</a></p></main></body></html>");
+    page += F("</pre><p><a href='/'>返回配置面板</a></p></main></body></html>");
     headers();
     web.send(200, "text/html; charset=utf-8", page);
 }
@@ -1023,7 +1073,7 @@ void handleSelectDevice() {
     lastPullAt = 0;
     if (authenticated && ws.isConnected()) sendSubscribe(runtimeSelectedDeviceId, true);
     pullTick();
-    web.sendHeader("Location", "/devices", true);
+    web.sendHeader("Location", "/", true);
     web.send(303, "text/plain; charset=utf-8", "设备已选择，等待数据");
 }
 
@@ -1034,7 +1084,7 @@ void handleClearSelected() {
     saveSelectedDevice();
     beacon.stop();
     ble.stop();
-    web.sendHeader("Location", "/devices", true);
+    web.sendHeader("Location", "/", true);
     web.send(303, "text/plain; charset=utf-8", "已停止模拟");
 }
 
@@ -1060,8 +1110,12 @@ void handleSave() {
     }
     copyText(next.server.ws, sizeof(next.server.ws), wsUrl);
     copyText(next.server.token, sizeof(next.server.token), web.arg("token"));
-    deriveHttpFromWs();
-    copyText(next.server.http, sizeof(next.server.http), String(config.server.http));
+    uint32_t intervalSec = web.arg("pullInterval").toInt();
+    if (intervalSec < kMinPullIntervalSec || intervalSec > kMaxPullIntervalSec) {
+        web.send(400, "text/plain; charset=utf-8", "拉取间隔必须为 1-3600 秒");
+        return;
+    }
+    next.pullIntervalSec = intervalSec;
     const String newPassword = web.arg("newPassword");
     if (newPassword.length() > 0) {
         if (newPassword.length() < 8 || newPassword.length() > 96 || newPassword != web.arg("confirmPassword")) {
@@ -1071,6 +1125,7 @@ void handleSave() {
         copyText(next.passwordHash, sizeof(next.passwordHash), passwordHash(newPassword));
     }
     config = next;
+    deriveHttpFromWs();
     saveConfig();
     session = "";
     headers();
@@ -1090,11 +1145,17 @@ void registerRoutes() {
     web.on("/setup-password", HTTP_GET, setupPasswordPage);
     web.on("/setup-password", HTTP_POST, handleSetupPasswordPost);
     web.on("/logout", HTTP_POST, handleLogout);
-    web.on("/devices", HTTP_GET, devicesPage);
     web.on("/panel", HTTP_GET, panelPage);
     web.on("/save", HTTP_POST, handleSave);
     web.on("/select", HTTP_POST, handleSelectDevice);
     web.on("/clear", HTTP_POST, handleClearSelected);
+    web.on("/refresh-devices", HTTP_POST, []() {
+        touchConfig();
+        if (!requireLogin()) return;
+        pollDeviceList();
+        web.sendHeader("Location", "/", true);
+        web.send(303, "text/plain; charset=utf-8", "数据源已刷新");
+    });
     web.onNotFound([]() { web.send(404, "text/plain", "Not found"); });
 }
 
@@ -1215,6 +1276,7 @@ void setup() {
     Serial.println("RemoteEnv ESP32-C3 client boot");
     pinMode(kLedPin, OUTPUT);
     digitalWrite(kLedPin, LOW);
+    xTaskCreate(ledTask, "status-led", 2048, nullptr, 1, nullptr);
     pinMode(kBootPin, INPUT_PULLUP);
     Serial.println("BOOT button: GPIO9");
     Serial.println("LED GPIO8 active-low: LOW=ON HIGH=OFF");
@@ -1222,7 +1284,7 @@ void setup() {
     loadConfig();
     beacon.begin();
     ble.begin();
-    pull.begin(config.server.http, config.server.token, kPullIntervalMs);
+    pull.begin(config.server.http, config.server.token, config.pullIntervalSec * 1000UL);
     if (!hasConfig() || digitalRead(kBootPin) == LOW) {
         startConfigMode();
         return;
