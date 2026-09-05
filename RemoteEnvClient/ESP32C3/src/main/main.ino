@@ -179,7 +179,14 @@ bool sessionValid() {
     int p = cookie.indexOf(expected);
     if (p < 0) return false;
     int end = p + expected.length();
-    return (p == 0 || cookie[p - 1] == ' ' || cookie[p - 1] == ';') && (end == cookie.length() || cookie[end] == ';');
+    bool valid = (p == 0 || cookie[p - 1] == ' ' || cookie[p - 1] == ';') &&
+                 (end == cookie.length() || cookie[end] == ';');
+    if (valid) {
+        sessionAt = millis();
+        web.sendHeader("Set-Cookie", String("REMOTENV_SESSION=") + session +
+                       "; Max-Age=1800; HttpOnly; SameSite=Strict; Path=/", true);
+    }
+    return valid;
 }
 
 void headers() {
@@ -266,6 +273,13 @@ void loadConfig() {
     if (config.pullIntervalSec < kMinPullIntervalSec || config.pullIntervalSec > kMaxPullIntervalSec) {
         config.pullIntervalSec = kPullIntervalMs / 1000;
     }
+}
+
+bool requireApiLogin() {
+    if (sessionValid()) return true;
+    headers();
+    web.send(401, "application/json; charset=utf-8", "{\"error\":\"login_required\"}");
+    return false;
 }
 
 void saveConfig() {
@@ -665,6 +679,24 @@ void pollDeviceList() {
     }
 }
 
+String deviceListJson() {
+    JsonDocument doc;
+    doc["selected"] = runtimeSelectedDeviceId;
+    JsonArray devices = doc["devices"].to<JsonArray>();
+    for (uint8_t i = 0; i < deviceList.count(); ++i) {
+        const RemoteDevice *source = deviceList.at(i);
+        JsonObject item = devices.add<JsonObject>();
+        item["id"] = source->deviceId;
+        item["name"] = source->name;
+        item["online"] = source->online;
+        item["wifi"] = source->wifiCount;
+        item["ble"] = source->bleCount;
+    }
+    String result;
+    serializeJson(doc, result);
+    return result;
+}
+
 void pullTick() {
     const uint32_t now = millis();
     if (!hasConfig() || WiFi.status() != WL_CONNECTED) return;
@@ -848,8 +880,8 @@ void configPage() {
     page += escapeHtml(config.server.token).c_str();
     page += F("'></label><label>拉取间隔（秒）<input name='pullInterval' type='number' min='1' max='3600' required value='");
     page += config.pullIntervalSec;
-    page += F("'></label><p class='muted'>每轮先停止旧广播，拉取最新数据，再从第 1 条开始以 25ms 间隔循环发送 WiFi Beacon 和蓝牙广播。</p><div class='actions'><button type='submit' formaction='/refresh-devices'>立即加载数据源</button></div>");
-    page += F("<h3>数据源设备</h3>");
+    page += F("'></label><p class='muted'>每轮先停止旧广播，拉取最新数据，再从第 1 条开始以 25ms 间隔循环发送 WiFi Beacon 和蓝牙广播。</p><div class='actions'><button id='loadSources' type='button' onclick='loadSources(true)'>立即加载数据源</button><span id='sourceStatus' class='muted'></span></div>");
+    page += F("<h3>数据源设备</h3><div id='sourceList'>");
     uint8_t total = deviceList.count();
     int requestedPage = web.hasArg("p") ? web.arg("p").toInt() : 0;
     const uint8_t perPage = 5;
@@ -878,7 +910,7 @@ void configPage() {
         if (currentPage + 1 < pages) { page += F("<a href='/?p="); page += currentPage + 1; page += F("'>下一页</a>"); }
         page += F("</div>");
     }
-    page += F("</section><section class='card'><h2>安全设置</h2><p>管理员密码不会以明文显示或上传。</p><div class='grid'><label>新管理员密码（可选）<input name='newPassword' type='password' minlength='8' maxlength='96' placeholder='留空表示不修改'></label><label>确认新管理员密码<input name='confirmPassword' type='password' minlength='8' maxlength='96' placeholder='再次输入新密码'></label></div><div class='actions'><button type='submit'>保存配置并重启</button><a href='/panel'><button type='button' class='secondary'>运行面板</button></a><button type='submit' formaction='/logout' class='secondary'>退出登录</button></div></section></form><script>function showWifi(n){document.querySelectorAll('.wifi-tab,.wifi-editor').forEach((e,i)=>e.classList.toggle('active',i%5===n))}function selectSource(v){fetch('/select',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'device='+encodeURIComponent(v)}).then(()=>location.reload())}</script></main></body></html>");
+    page += F("</div></section><section class='card'><h2>安全设置</h2><p>管理员密码不会以明文显示或上传。</p><div class='grid'><label>新管理员密码（可选）<input name='newPassword' type='password' minlength='8' maxlength='96' placeholder='留空表示不修改'></label><label>确认新管理员密码<input name='confirmPassword' type='password' minlength='8' maxlength='96' placeholder='再次输入新密码'></label></div><div class='actions'><button type='submit'>保存配置并重启</button><a href='/panel'><button type='button' class='secondary'>运行面板</button></a><button type='submit' formaction='/logout' class='secondary'>退出登录</button></div></section></form><script>let sourceData=[],sourcePage=0;const esc=s=>String(s==null?'':s).replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));function showWifi(n){document.querySelectorAll('.wifi-tab,.wifi-editor').forEach((e,i)=>e.classList.toggle('active',i%5===n))}function renderSources(selected){const box=document.getElementById('sourceList'),pages=Math.max(1,Math.ceil(sourceData.length/5));sourcePage=Math.min(sourcePage,pages-1);const items=sourceData.slice(sourcePage*5,sourcePage*5+5);box.innerHTML=items.length?\"<div class='device-grid'>\"+items.map(d=>\"<label class='device \"+(d.id===selected?'selected':'')+\"'><input type='radio' name='sourceDevice' value='\"+esc(d.id)+\"' \"+(d.id===selected?'checked':'')+\" onchange='selectSource(this.value)'><span class='device-name'>\"+esc(d.name)+\"</span><span class='device-meta'>\"+esc(d.id)+\"</span><span class='pill \"+(d.online?'online':'')+\"'>\"+(d.online?'在线':'离线')+\"</span> <span class='tag'>WiFi \"+d.wifi+\"</span> <span class='tag'>BLE \"+d.ble+\"</span></label>\").join('')+\"</div><div class='pagination'><button type='button' class='secondary' onclick='changeSourcePage(-1)' \"+(sourcePage?'':'disabled')+\">上一页</button><span class='muted'>第 \"+(sourcePage+1)+\" / \"+pages+\" 页</span><button type='button' onclick='changeSourcePage(1)' \"+(sourcePage+1<pages?'':'disabled')+\">下一页</button></div>\":\"<p class='muted'>服务端当前没有可见的数据源设备。</p>\";box.dataset.selected=selected||''}function changeSourcePage(step){sourcePage+=step;renderSources(document.getElementById('sourceList').dataset.selected)}async function api(url,opt){const r=await fetch(url,opt);if(r.status===401){location.href='/login';throw Error('login_required')}if(!r.ok)throw Error(await r.text());return r.json()}async function loadSources(refresh){const b=document.getElementById('loadSources'),s=document.getElementById('sourceStatus');b.disabled=true;s.textContent='正在拉取…';try{const d=await api(refresh?'/api/devices/refresh':'/api/devices',{method:refresh?'POST':'GET'});sourceData=d.devices||[];sourcePage=0;renderSources(d.selected);s.textContent='已加载 '+sourceData.length+' 个设备'}catch(e){if(e.message!=='login_required')s.textContent='加载失败：'+e.message}finally{b.disabled=false}}async function selectSource(v){const s=document.getElementById('sourceStatus');s.textContent='正在切换…';try{const d=await api('/api/select',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'device='+encodeURIComponent(v)});renderSources(d.selected);s.textContent='已选中，正在拉取模拟数据'}catch(e){if(e.message!=='login_required')s.textContent='切换失败：'+e.message}}loadSources(false);setInterval(()=>api('/api/session').catch(()=>{}),60000);</script></main></body></html>");
     headers();
     web.send(200, "text/html; charset=utf-8", page);
 }
@@ -1088,6 +1120,26 @@ void handleClearSelected() {
     web.send(303, "text/plain; charset=utf-8", "已停止模拟");
 }
 
+void handleApiSelectDevice() {
+    touchConfig();
+    if (!requireApiLogin()) return;
+    String deviceId = web.arg("device");
+    if (!deviceId.length() || deviceId.length() >= sizeof(runtimeSelectedDeviceId)) {
+        web.send(400, "application/json; charset=utf-8", "{\"error\":\"invalid_device\"}");
+        return;
+    }
+    copyText(runtimeSelectedDeviceId, sizeof(runtimeSelectedDeviceId), deviceId);
+    saveSelectedDevice();
+    beacon.stop();
+    ble.stop();
+    lastSelectedWifiJson[0] = 0;
+    lastSelectedBleJson[0] = 0;
+    lastSelectedPullAt = 0;
+    if (authenticated && ws.isConnected()) sendSubscribe(runtimeSelectedDeviceId, true);
+    headers();
+    web.send(200, "application/json; charset=utf-8", deviceListJson());
+}
+
 void handleSave() {
     touchConfig();
     if (!requireLogin()) return;
@@ -1149,13 +1201,26 @@ void registerRoutes() {
     web.on("/save", HTTP_POST, handleSave);
     web.on("/select", HTTP_POST, handleSelectDevice);
     web.on("/clear", HTTP_POST, handleClearSelected);
-    web.on("/refresh-devices", HTTP_POST, []() {
+    web.on("/api/devices", HTTP_GET, []() {
         touchConfig();
-        if (!requireLogin()) return;
-        pollDeviceList();
-        web.sendHeader("Location", "/", true);
-        web.send(303, "text/plain; charset=utf-8", "数据源已刷新");
+        if (!requireApiLogin()) return;
+        headers();
+        web.send(200, "application/json; charset=utf-8", deviceListJson());
     });
+    web.on("/api/session", HTTP_GET, []() {
+        touchConfig();
+        if (!requireApiLogin()) return;
+        headers();
+        web.send(200, "application/json; charset=utf-8", "{\"ok\":true}");
+    });
+    web.on("/api/devices/refresh", HTTP_POST, []() {
+        touchConfig();
+        if (!requireApiLogin()) return;
+        pollDeviceList();
+        headers();
+        web.send(200, "application/json; charset=utf-8", deviceListJson());
+    });
+    web.on("/api/select", HTTP_POST, handleApiSelectDevice);
     web.onNotFound([]() { web.send(404, "text/plain", "Not found"); });
 }
 
