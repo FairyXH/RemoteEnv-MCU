@@ -99,8 +99,27 @@ uint8_t logCount = 0;
 String remoteDevicesJson;
 bool remoteDevicesDirty = true;
 uint32_t lastDeviceListUpdate = 0;
-bool pullInFlight = false;
 uint32_t nextPollDeadline = 0;
+enum class HttpJobKind : uint8_t { Latest, Devices };
+struct HttpJob {
+    HttpJobKind kind;
+    char url[256];
+    char token[160];
+};
+QueueHandle_t httpJobQueue = nullptr;
+SemaphoreHandle_t httpResultMutex = nullptr;
+volatile bool httpInFlight = false;
+volatile bool httpResultReady = false;
+volatile HttpJobKind activeHttpJob = HttpJobKind::Latest;
+HttpJobKind completedHttpJob = HttpJobKind::Latest;
+String httpResultBody;
+int httpResultCode = 0;
+bool httpResultOk = false;
+bool latestPullPending = false;
+bool deviceListPullPending = false;
+uint32_t deviceListGeneration = 0;
+String deviceListError;
+BleBeaconDevice bleScratch[16]{};
 enum class LedMode : uint8_t { Config, Disconnected, Normal };
 volatile LedMode ledMode = LedMode::Disconnected;
 
@@ -458,11 +477,11 @@ void applyBleEnvelope(const char *deviceId, JsonVariantConst data) {
         }
         return;
     }
-    BleBeaconDevice list[16]{};
+    memset(bleScratch, 0, sizeof(bleScratch));
     uint8_t count = 0;
     for (JsonVariantConst item : devices) {
         if (count >= 16) break;
-        BleBeaconDevice &d = list[count];
+        BleBeaconDevice &d = bleScratch[count];
         memset(&d, 0, sizeof(d));
         String address = item["address"] | "";
         address.toCharArray(d.address, sizeof(d.address));
@@ -515,7 +534,7 @@ void applyBleEnvelope(const char *deviceId, JsonVariantConst data) {
     }
     deviceList.touchBle(deviceId, count);
     if (hasSelectedDevice() && strcmp(runtimeSelectedDeviceId, deviceId) == 0) {
-        ble.setDevices(list, count);
+        ble.setDevices(bleScratch, count);
         DynamicJsonDocument summary(4096);
         JsonArray arr = summary.to<JsonArray>();
         for (JsonVariantConst item : devices) {
@@ -599,31 +618,59 @@ void sendAuth() {
     logLine("发送 Consumer 认证");
 }
 
-bool httpGet(const String &url, String &body, int &code) {
+bool httpGet(const HttpJob &job, String &body, int &code) {
     HTTPClient http;
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     http.setTimeout(8000);
-    if (!http.begin(url)) return false;
-    http.addHeader("X-Admin-Token", String(config.server.token));
+    if (!http.begin(job.url)) return false;
+    http.addHeader("X-Admin-Token", job.token);
     code = http.GET();
-    if (code > 0) body = http.getString();
+    const int contentLength = http.getSize();
+    if (code > 0 && (contentLength < 0 || contentLength <= 32768)) body = http.getString();
+    if (body.length() > 32768) {
+        body = String();
+        code = 413;
+    }
     http.end();
     return code > 0;
 }
 
-void pollLatestSelected() {
-    if (!hasConfig() || WiFi.status() != WL_CONNECTED || pullInFlight) return;
-    if (!hasSelectedDevice() || !config.server.http[0]) return;
-    pullInFlight = true;
-    String url = String(config.server.http) + "/api/latest-data?device_id=" + String(runtimeSelectedDeviceId);
-    String body;
-    int code = 0;
-    bool ok = httpGet(url, body, code);
-    pullInFlight = false;
-    if (!ok) {
-        logLine(String("HTTP 拉取失败：") + url);
-        return;
+void httpWorkerTask(void *) {
+    HttpJob job{};
+    for (;;) {
+        if (xQueueReceive(httpJobQueue, &job, portMAX_DELAY) != pdTRUE) continue;
+        String body;
+        int code = 0;
+        bool ok = httpGet(job, body, code);
+        xSemaphoreTake(httpResultMutex, portMAX_DELAY);
+        completedHttpJob = job.kind;
+        httpResultBody = body;
+        httpResultCode = code;
+        httpResultOk = ok;
+        httpResultReady = true;
+        xSemaphoreGive(httpResultMutex);
     }
+}
+
+void dispatchHttpJob() {
+    if (httpInFlight || !httpJobQueue || WiFi.status() != WL_CONNECTED || !config.server.http[0]) return;
+    HttpJob job{};
+    if (deviceListPullPending) {
+        job.kind = HttpJobKind::Devices;
+        deviceListPullPending = false;
+        copyText(job.url, sizeof(job.url), String(config.server.http) + "/api/devices?role=collector");
+    } else if (latestPullPending && hasSelectedDevice()) {
+        job.kind = HttpJobKind::Latest;
+        latestPullPending = false;
+        copyText(job.url, sizeof(job.url), String(config.server.http) + "/api/latest-data?device_id=" + runtimeSelectedDeviceId);
+    } else return;
+    copyText(job.token, sizeof(job.token), String(config.server.token));
+    activeHttpJob = job.kind;
+    httpInFlight = true;
+    if (xQueueSend(httpJobQueue, &job, 0) != pdTRUE) httpInFlight = false;
+}
+
+void applyLatestResult(const String &body) {
     DynamicJsonDocument doc(8192);
     if (deserializeJson(doc, body) != DeserializationError::Ok) {
         logLine("latest-data 解析失败");
@@ -643,14 +690,12 @@ void pollLatestSelected() {
     nextPollDeadline = millis() + kPollDeadlineMs;
 }
 
-void pollDeviceList() {
-    if (!hasConfig() || WiFi.status() != WL_CONNECTED || !config.server.http[0]) return;
-    String url = String(config.server.http) + "/api/devices?role=collector";
-    String body;
-    int code = 0;
-    if (!httpGet(url, body, code)) return;
+void applyDeviceListResult(const String &body) {
     DynamicJsonDocument doc(8192);
-    if (deserializeJson(doc, body) != DeserializationError::Ok) return;
+    if (deserializeJson(doc, body) != DeserializationError::Ok) {
+        logLine("设备列表解析失败");
+        return;
+    }
     JsonArrayConst arr = doc["devices"].as<JsonArrayConst>();
     if (arr.isNull()) return;
     char previousSelection[sizeof(runtimeSelectedDeviceId)]{};
@@ -664,6 +709,7 @@ void pollDeviceList() {
     deviceList.sortOnlineFirst();
     remoteDevicesDirty = true;
     lastDeviceListUpdate = millis();
+    ++deviceListGeneration;
     if (previousSelection[0]) {
         uint8_t index = 0;
         if (deviceList.find(previousSelection, index)) {
@@ -682,6 +728,10 @@ void pollDeviceList() {
 String deviceListJson() {
     JsonDocument doc;
     doc["selected"] = runtimeSelectedDeviceId;
+    doc["generation"] = deviceListGeneration;
+    doc["loading"] = deviceListPullPending ||
+                     (httpInFlight && activeHttpJob == HttpJobKind::Devices);
+    if (deviceListError.length()) doc["error"] = deviceListError;
     JsonArray devices = doc["devices"].to<JsonArray>();
     for (uint8_t i = 0; i < deviceList.count(); ++i) {
         const RemoteDevice *source = deviceList.at(i);
@@ -697,7 +747,12 @@ String deviceListJson() {
     return result;
 }
 
+void processHttpResult();
+void pollLatestSelected();
+void pollDeviceList();
+
 void pullTick() {
+    processHttpResult();
     const uint32_t now = millis();
     if (!hasConfig() || WiFi.status() != WL_CONNECTED) return;
     const uint32_t pullIntervalMs = config.pullIntervalSec * 1000UL;
@@ -800,6 +855,42 @@ void ledTask(void *) {
     }
 }
 
+void processHttpResult() {
+    if (!httpResultReady) return;
+    xSemaphoreTake(httpResultMutex, portMAX_DELAY);
+    HttpJobKind kind = completedHttpJob;
+    String body = httpResultBody;
+    int code = httpResultCode;
+    bool ok = httpResultOk;
+    httpResultBody = String();
+    httpResultReady = false;
+    xSemaphoreGive(httpResultMutex);
+    httpInFlight = false;
+    if (!ok || code < 200 || code >= 300) {
+        logLine(String("HTTP 请求失败，状态=") + code);
+        if (kind == HttpJobKind::Devices) deviceListError = String("HTTP 状态 ") + code;
+    } else if (kind == HttpJobKind::Devices) {
+        deviceListError = "";
+        applyDeviceListResult(body);
+    } else {
+        applyLatestResult(body);
+    }
+    dispatchHttpJob();
+}
+
+void pollLatestSelected() {
+    if (!hasConfig() || !hasSelectedDevice()) return;
+    latestPullPending = true;
+    dispatchHttpJob();
+}
+
+void pollDeviceList() {
+    if (!hasConfig()) return;
+    deviceListError = "";
+    deviceListPullPending = true;
+    dispatchHttpJob();
+}
+
 void ledMaintain() {
     ledMode = configMode
                                ? LedMode::Config
@@ -880,37 +971,10 @@ void configPage() {
     page += escapeHtml(config.server.token).c_str();
     page += F("'></label><label>拉取间隔（秒）<input name='pullInterval' type='number' min='1' max='3600' required value='");
     page += config.pullIntervalSec;
-    page += F("'></label><p class='muted'>每轮先停止旧广播，拉取最新数据，再从第 1 条开始以 25ms 间隔循环发送 WiFi Beacon 和蓝牙广播。</p><div class='actions'><button id='loadSources' type='button' onclick='loadSources(true)'>立即加载数据源</button><span id='sourceStatus' class='muted'></span></div>");
+    page += F("'></label><p class='muted'>每轮先停止旧广播，拉取最新数据，再从第 1 条开始以 25ms 间隔循环发送 WiFi Beacon 和蓝牙广播。</p><div class='actions'><button id='loadSources' type='button' onclick='loadSourcesAsync()'>立即加载数据源</button><span id='sourceStatus' class='muted'></span></div>");
     page += F("<h3>数据源设备</h3><div id='sourceList'>");
-    uint8_t total = deviceList.count();
-    int requestedPage = web.hasArg("p") ? web.arg("p").toInt() : 0;
-    const uint8_t perPage = 5;
-    uint8_t pages = total ? (total + perPage - 1) / perPage : 1;
-    uint8_t currentPage = constrain(requestedPage, 0, pages - 1);
-    if (!total) page += F("<p class='muted'>点击“立即加载数据源”获取服务端设备列表。</p>");
-    else {
-        page += F("<div class='device-grid'>");
-        uint8_t end = min<uint8_t>((currentPage + 1) * perPage, total);
-        for (uint8_t i = currentPage * perPage; i < end; ++i) {
-            const RemoteDevice *d = deviceList.at(i);
-            bool selected = hasSelectedDevice() && strcmp(runtimeSelectedDeviceId, d->deviceId) == 0;
-            page += F("<label class='device"); if (selected) page += F(" selected");
-            page += F("'><input type='radio' name='sourceDevice' value='");
-            page += escapeHtml(d->deviceId); page += F("'"); if (selected) page += F(" checked");
-            page += F(" onchange='selectSource(this.value)'><span class='device-name'>");
-            page += escapeHtml(d->name); page += F("</span><span class='device-meta'>");
-            page += escapeHtml(d->deviceId); page += F("</span><span class='pill ");
-            if (d->online) page += F("online"); page += F("'>"); page += d->online ? F("在线") : F("离线");
-            page += F("</span> <span class='tag'>WiFi "); page += d->wifiCount;
-            page += F("</span> <span class='tag'>BLE "); page += d->bleCount; page += F("</span></label>");
-        }
-        page += F("</div><div class='pagination'>");
-        if (currentPage > 0) { page += F("<a href='/?p="); page += currentPage - 1; page += F("'>上一页</a>"); }
-        page += F("<span class='muted'>第 "); page += currentPage + 1; page += F(" / "); page += pages; page += F(" 页</span>");
-        if (currentPage + 1 < pages) { page += F("<a href='/?p="); page += currentPage + 1; page += F("'>下一页</a>"); }
-        page += F("</div>");
-    }
-    page += F("</div></section><section class='card'><h2>安全设置</h2><p>管理员密码不会以明文显示或上传。</p><div class='grid'><label>新管理员密码（可选）<input name='newPassword' type='password' minlength='8' maxlength='96' placeholder='留空表示不修改'></label><label>确认新管理员密码<input name='confirmPassword' type='password' minlength='8' maxlength='96' placeholder='再次输入新密码'></label></div><div class='actions'><button type='submit'>保存配置并重启</button><a href='/panel'><button type='button' class='secondary'>运行面板</button></a><button type='submit' formaction='/logout' class='secondary'>退出登录</button></div></section></form><script>let sourceData=[],sourcePage=0;const esc=s=>String(s==null?'':s).replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));function showWifi(n){document.querySelectorAll('.wifi-tab,.wifi-editor').forEach((e,i)=>e.classList.toggle('active',i%5===n))}function renderSources(selected){const box=document.getElementById('sourceList'),pages=Math.max(1,Math.ceil(sourceData.length/5));sourcePage=Math.min(sourcePage,pages-1);const items=sourceData.slice(sourcePage*5,sourcePage*5+5);box.innerHTML=items.length?\"<div class='device-grid'>\"+items.map(d=>\"<label class='device \"+(d.id===selected?'selected':'')+\"'><input type='radio' name='sourceDevice' value='\"+esc(d.id)+\"' \"+(d.id===selected?'checked':'')+\" onchange='selectSource(this.value)'><span class='device-name'>\"+esc(d.name)+\"</span><span class='device-meta'>\"+esc(d.id)+\"</span><span class='pill \"+(d.online?'online':'')+\"'>\"+(d.online?'在线':'离线')+\"</span> <span class='tag'>WiFi \"+d.wifi+\"</span> <span class='tag'>BLE \"+d.ble+\"</span></label>\").join('')+\"</div><div class='pagination'><button type='button' class='secondary' onclick='changeSourcePage(-1)' \"+(sourcePage?'':'disabled')+\">上一页</button><span class='muted'>第 \"+(sourcePage+1)+\" / \"+pages+\" 页</span><button type='button' onclick='changeSourcePage(1)' \"+(sourcePage+1<pages?'':'disabled')+\">下一页</button></div>\":\"<p class='muted'>服务端当前没有可见的数据源设备。</p>\";box.dataset.selected=selected||''}function changeSourcePage(step){sourcePage+=step;renderSources(document.getElementById('sourceList').dataset.selected)}async function api(url,opt){const r=await fetch(url,opt);if(r.status===401){location.href='/login';throw Error('login_required')}if(!r.ok)throw Error(await r.text());return r.json()}async function loadSources(refresh){const b=document.getElementById('loadSources'),s=document.getElementById('sourceStatus');b.disabled=true;s.textContent='正在拉取…';try{const d=await api(refresh?'/api/devices/refresh':'/api/devices',{method:refresh?'POST':'GET'});sourceData=d.devices||[];sourcePage=0;renderSources(d.selected);s.textContent='已加载 '+sourceData.length+' 个设备'}catch(e){if(e.message!=='login_required')s.textContent='加载失败：'+e.message}finally{b.disabled=false}}async function selectSource(v){const s=document.getElementById('sourceStatus');s.textContent='正在切换…';try{const d=await api('/api/select',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'device='+encodeURIComponent(v)});renderSources(d.selected);s.textContent='已选中，正在拉取模拟数据'}catch(e){if(e.message!=='login_required')s.textContent='切换失败：'+e.message}}loadSources(false);setInterval(()=>api('/api/session').catch(()=>{}),60000);</script></main></body></html>");
+    page += F("<p class='muted'>正在读取设备缓存…</p>");
+    page += F("</div></section><section class='card'><h2>安全设置</h2><p>管理员密码不会以明文显示或上传。</p><div class='grid'><label>新管理员密码（可选）<input name='newPassword' type='password' minlength='8' maxlength='96' placeholder='留空表示不修改'></label><label>确认新管理员密码<input name='confirmPassword' type='password' minlength='8' maxlength='96' placeholder='再次输入新密码'></label></div><div class='actions'><button type='submit'>保存配置并重启</button><a href='/panel'><button type='button' class='secondary'>运行面板</button></a><button type='submit' formaction='/logout' class='secondary'>退出登录</button></div></section></form><script>let sourceData=[],sourcePage=0;const esc=s=>String(s==null?'':s).replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));function showWifi(n){document.querySelectorAll('.wifi-tab,.wifi-editor').forEach((e,i)=>e.classList.toggle('active',i%5===n))}function renderSources(selected){const box=document.getElementById('sourceList'),pages=Math.max(1,Math.ceil(sourceData.length/5));sourcePage=Math.min(sourcePage,pages-1);const items=sourceData.slice(sourcePage*5,sourcePage*5+5);box.innerHTML=items.length?\"<div class='device-grid'>\"+items.map(d=>\"<label class='device \"+(d.id===selected?'selected':'')+\"'><input type='radio' name='sourceDevice' value='\"+esc(d.id)+\"' \"+(d.id===selected?'checked':'')+\" onchange='selectSource(this.value)'><span class='device-name'>\"+esc(d.name)+\"</span><span class='device-meta'>\"+esc(d.id)+\"</span><span class='pill \"+(d.online?'online':'')+\"'>\"+(d.online?'在线':'离线')+\"</span> <span class='tag'>WiFi \"+d.wifi+\"</span> <span class='tag'>BLE \"+d.ble+\"</span></label>\").join('')+\"</div><div class='pagination'><button type='button' class='secondary' onclick='changeSourcePage(-1)' \"+(sourcePage?'':'disabled')+\">上一页</button><span class='muted'>第 \"+(sourcePage+1)+\" / \"+pages+\" 页</span><button type='button' onclick='changeSourcePage(1)' \"+(sourcePage+1<pages?'':'disabled')+\">下一页</button></div>\":\"<p class='muted'>服务端当前没有可见的数据源设备。</p>\";box.dataset.selected=selected||''}function changeSourcePage(step){sourcePage+=step;renderSources(document.getElementById('sourceList').dataset.selected)}async function api(url,opt){const r=await fetch(url,opt);if(r.status===401){location.href='/login';throw Error('login_required')}if(!r.ok)throw Error(await r.text());return r.json()}async function loadSources(refresh){const b=document.getElementById('loadSources'),s=document.getElementById('sourceStatus');b.disabled=true;s.textContent='正在拉取…';try{const d=await api(refresh?'/api/devices/refresh':'/api/devices',{method:refresh?'POST':'GET'});sourceData=d.devices||[];sourcePage=0;renderSources(d.selected);s.textContent='已加载 '+sourceData.length+' 个设备'}catch(e){if(e.message!=='login_required')s.textContent='加载失败：'+e.message}finally{b.disabled=false}}async function loadSourcesAsync(){const b=document.getElementById('loadSources'),s=document.getElementById('sourceStatus');b.disabled=true;s.textContent='正在拉取…';try{let d=await api('/api/devices/refresh',{method:'POST'}),tries=0;while(d.loading&&tries++<100){await new Promise(r=>setTimeout(r,300));d=await api('/api/devices')}if(d.loading)throw Error('服务端请求超时');sourceData=d.devices||[];sourcePage=0;renderSources(d.selected);s.textContent='已加载 '+sourceData.length+' 个设备'}catch(e){if(e.message!=='login_required')s.textContent='加载失败：'+e.message}finally{b.disabled=false}}async function selectSource(v){const s=document.getElementById('sourceStatus');s.textContent='正在切换…';try{const d=await api('/api/select',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'device='+encodeURIComponent(v)});renderSources(d.selected);s.textContent='已选中，正在拉取模拟数据'}catch(e){if(e.message!=='login_required')s.textContent='切换失败：'+e.message}}loadSources(false);setInterval(()=>api('/api/session').catch(()=>{}),60000);</script></main></body></html>");
     headers();
     web.send(200, "text/html; charset=utf-8", page);
 }
@@ -1342,6 +1406,19 @@ void setup() {
     pinMode(kLedPin, OUTPUT);
     digitalWrite(kLedPin, LOW);
     xTaskCreate(ledTask, "status-led", 2048, nullptr, 1, nullptr);
+    httpJobQueue = xQueueCreate(1, sizeof(HttpJob));
+    httpResultMutex = xSemaphoreCreateMutex();
+    BaseType_t httpTaskCreated = pdFAIL;
+    if (httpJobQueue && httpResultMutex) {
+        httpTaskCreated = xTaskCreate(httpWorkerTask, "http-worker", 8192, nullptr, 1, nullptr);
+    }
+    if (httpTaskCreated != pdPASS) {
+        if (httpJobQueue) vQueueDelete(httpJobQueue);
+        if (httpResultMutex) vSemaphoreDelete(httpResultMutex);
+        httpJobQueue = nullptr;
+        httpResultMutex = nullptr;
+        logLine("HTTP 后台任务创建失败");
+    }
     pinMode(kBootPin, INPUT_PULLUP);
     Serial.println("BOOT button: GPIO9");
     Serial.println("LED GPIO8 active-low: LOW=ON HIGH=OFF");
