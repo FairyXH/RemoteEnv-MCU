@@ -1,0 +1,3 @@
+.pio/
+.arduino-build-*/
+upload-checksum-retry*.log
